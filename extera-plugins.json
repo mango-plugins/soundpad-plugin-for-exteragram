@@ -2,14 +2,14 @@
   "schema": 1,
   "name": "SoundPad Repository",
   "description": "SoundPad plugin for ExteraGram",
-  "author": "kostapechonkin-jpg",
+  "author": "@Mango_mango_mango_mango & ChatGPT",
   "homepage": "https://github.com/kostapechonkin-jpg/soundpad-plugin-for-exteragram",
   "plugins": [
     {
       "id": "soundpad",
       "name": "SoundPad",
       "description": "32-slot neon floating soundboard for voice messages and calls",
-      "author": "kostapechonkin-jpg",
+      "author": "@Mango_mango_mango_mango & ChatGPT",
       "version": "0.3.4",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
@@ -19,8 +19,8 @@
         "tools"
       ],
       "file": "plugins/soundpad/soundpad.plugin",
-      "sha256": "57a4ed250cb27249f3d654d3e051a884584a1fe70b06b2abadc767d55944e9a6",
-      "size": 33656
+      "sha256": "f46ae9b5a9be480a77774bbaee3cefbd54164054703afba90ec33055aaa7cbf5",
+      "size": 33672
     }
   ]
 }
