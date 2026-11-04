@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -353,11 +353,32 @@ class SoundPadPlugin(BasePlugin):
     def hide_panel(self):run_on_ui_thread(self.panel.hide)
     def open_picker(self,view):
         try:
-            if self.activity is None:self.notify("Відкрий Telegram і повтори імпорт"); return
+            # Resolve the live Activity from the settings row itself. The plugin
+            # may be opened while LaunchActivity is already resumed, so an
+            # onResume hook alone is not a reliable source of the Activity.
+            ctx = view.getContext() if view is not None else None
+            activity = None
+            for _ in range(12):
+                if ctx is None: break
+                try:
+                    ctx.startActivityForResult
+                    activity = ctx
+                    break
+                except Exception:
+                    try: ctx = ctx.getBaseContext()
+                    except Exception: break
+            if activity is None:
+                self.notify("Не вдалося отримати вікно ExteraGram. Закрий налаштування й відкрий їх знову.")
+                return
+            self.activity = activity
             from android.content import Intent
-            it=Intent(Intent.ACTION_OPEN_DOCUMENT); it.addCategory(Intent.CATEGORY_OPENABLE); it.setType("audio/*")
-            self.activity.startActivityForResult(it,IMPORT_CODE)
-        except Exception as e:self.notify("Помилка вибору файлу: "+str(e))
+            it=Intent(Intent.ACTION_OPEN_DOCUMENT)
+            it.addCategory(Intent.CATEGORY_OPENABLE)
+            it.setType("audio/*")
+            activity.startActivityForResult(it,IMPORT_CODE)
+        except Exception as e:
+            log("SoundPad picker: "+str(e))
+            self.notify("Помилка відкриття файлів: "+str(e))
     def refresh_settings(self):
         try:self.set_setting("_refresh",str(time.time()),reload_settings=True)
         except Exception:pass
@@ -368,7 +389,7 @@ class SoundPadPlugin(BasePlugin):
               Switch(key="enabled",text="Увімкнути плагін",default=True),
               Text(text="Плаваюча панель: 4×2 кнопки, 4 сторінки. Працює під час запису голосових і дзвінків, якщо відповідні хуки доступні."),
               Text(text="＋ ІМПОРТУВАТИ АУДІО",icon="msg_addbot",on_click=self.open_picker),
-              Text(text="⏹ ЗУПИНИТИ ВСІ ЗВУКИ",icon="msg_cancel",red=True,on_click=lambda v:self.stop_all()),Divider()]
+              Divider()]
         for i in range(SLOTS):
             current=self.get_setting("slot_%d_file"%i,"")
             idx=files.index(current)+1 if current in files else 0
