@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -307,7 +307,13 @@ class SoundPadPlugin(BasePlugin):
         except Exception:log(msg)
     def hook(self,cls,name,types,handler):
         try:
-            m=cls.getDeclaredMethod(name,*types); m.setAccessible(True)
+            try:
+                # Public inherited Android callbacks (notably Activity.onActivityResult)
+                # may not be declared directly on LaunchActivity.
+                m=cls.getMethod(name,*types)
+            except Exception:
+                m=cls.getDeclaredMethod(name,*types)
+            m.setAccessible(True)
             u=self.hook_method(m,handler)
             if u:self.unhooks.append(u); log("SoundPad hook: "+name); return True
         except Exception as e:log("SoundPad hook unavailable "+name+": "+str(e))
