@@ -27,7 +27,7 @@ def sounds_dir():
     ensure_dir_exists(path)
     return path
 
-def decode_audio(path):
+def decode_audio(path, target_rate=RATE):
     from android.media import MediaExtractor, MediaCodec, MediaFormat
     extractor=MediaExtractor(); codec=None; chunks=[]
     rate=RATE; channels=1; encoding=2
@@ -82,8 +82,8 @@ def decode_audio(path):
             for i in range(0,len(samples)-channels+1,channels):
                 mono.append(int(sum(samples[i:i+channels])/channels))
             samples=mono
-        if rate!=RATE and samples:
-            ratio=rate/float(RATE); count=max(1,int(len(samples)/ratio)); out=array("h")
+        if rate!=target_rate and samples:
+            ratio=rate/float(target_rate); count=max(1,int(len(samples)/ratio)); out=array("h")
             for i in range(count):
                 p=i*ratio; a=min(int(p),len(samples)-1); b=min(a+1,len(samples)-1)
                 out.append(int(samples[a]+(samples[b]-samples[a])*(p-a)))
@@ -98,14 +98,14 @@ def decode_audio(path):
 
 class Mixer:
     def __init__(self):
-        self.lock=threading.RLock(); self.cache={}; self.voices=[]
+        self.lock=threading.RLock(); self.cache={}; self.voices=[]; self.target_rate=RATE
     def play(self,path,gain=1.0):
         def worker():
             try:
-                data=self.cache.get(path)
+                key=(path,self.target_rate); data=self.cache.get(key)
                 if data is None:
-                    data=decode_audio(path)
-                    with self.lock: self.cache[path]=data
+                    data=decode_audio(path,self.target_rate)
+                    with self.lock: self.cache[key]=data
                 if data:
                     with self.lock: self.voices.append([data,0,float(gain)])
             except Exception as e: log("SoundPad decode: "+str(e))
@@ -234,7 +234,10 @@ class Panel:
 
 class RecordStartHook(MethodHook):
     def __init__(self,p): self.p=p
-    def after_hooked_method(self,param): self.p.show_panel()
+    def after_hooked_method(self,param):
+        try: mixer.target_rate=int(param.args[1])
+        except Exception: mixer.target_rate=RATE
+        self.p.show_panel()
 class RecordStopHook(MethodHook):
     def __init__(self,p): self.p=p
     def before_hooked_method(self,param): mixer.stop(); self.p.hide_panel()
@@ -243,7 +246,7 @@ class VoipStateHook(MethodHook):
     def after_hooked_method(self,param):
         try:
             state=int(param.args[0])
-            if state==self.est:self.p.show_panel()
+            if state==self.est: mixer.target_rate=RATE; self.p.show_panel()
             elif state in self.ends:mixer.stop(); self.p.hide_panel()
         except Exception as e: log("SoundPad call state: "+str(e))
 class ResumeHook(MethodHook):
