@@ -1,0 +1,738 @@
+import os, struct, threading, time, shutil
+from array import array
+from typing import Any, List
+from base_plugin import BasePlugin, AppEvent, MethodHook
+from android_utils import OnClickListener, run_on_ui_thread, log
+from file_utils import ensure_dir_exists, get_plugins_dir
+from hook_utils import find_class
+from ui.settings import Header, Divider, Input, Selector, Switch, Text
+from android.graphics import Color
+from android.view import Gravity, View, MotionEvent
+from java import dynamic_proxy
+from android.widget import FrameLayout, LinearLayout, TextView
+
+__id__ = "soundpad_reloaded"
+__name__ = "SoundPad Reloaded"
+__description__ = "32-slot floating soundboard for voice messages, video notes and calls"
+__author__ = "@Mango_mango_mango_mango & ChatGPT"
+__version__ = "0.4.1_reloaded"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=13.1.1"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["media", "tools"]
+
+SLOTS, PAGE_SIZE, RATE, IMPORT_CODE = 32, 8, 48000, 42731
+
+def sounds_dir():
+    path=os.path.join(get_plugins_dir(),"soundpad_sounds")
+    ensure_dir_exists(path)
+    return path
+
+def external_sounds_dir():
+    # Public shared-storage folder visible in Android's Downloads app.
+    path="/storage/emulated/0/Download/exterasounds"
+    if not os.path.isdir(path):
+        os.makedirs(path,exist_ok=True)
+    return path
+
+def sync_external_sounds():
+    """Copy supported audio files from Downloads/exterasounds into plugin storage."""
+    src=external_sounds_dir()
+    dst=sounds_dir()
+    copied=0
+    supported=(".mp3",".wav",".ogg",".m4a",".aac",".flac",".3gp",".opus")
+    try:
+        for name in sorted(os.listdir(src)):
+            source=os.path.join(src,name)
+            if not os.path.isfile(source) or not name.lower().endswith(supported):
+                continue
+            target=os.path.join(dst,name)
+            if os.path.exists(target) and os.path.getmtime(target)>=os.path.getmtime(source) and os.path.getsize(target)==os.path.getsize(source):
+                continue
+            base,ext=os.path.splitext(name)
+            candidate=target; n=1
+            while os.path.exists(candidate) and candidate!=target:
+                candidate=os.path.join(dst,"%s_%d%s"%(base,n,ext)); n+=1
+            shutil.copyfile(source,candidate)
+            copied+=1
+        return copied
+    except Exception as e:
+        log("SoundPad Downloads scan: "+str(e))
+        return -1
+
+def decode_audio(path, target_rate=RATE):
+    from android.media import MediaExtractor, MediaCodec, MediaFormat
+    extractor=MediaExtractor(); codec=None; chunks=[]
+    rate=RATE; channels=1; encoding=2
+    try:
+        extractor.setDataSource(path)
+        track=-1; fmt=None
+        for i in range(extractor.getTrackCount()):
+            f=extractor.getTrackFormat(i); mime=f.getString(MediaFormat.KEY_MIME)
+            if mime and str(mime).startswith("audio/"):
+                track=i; fmt=f; break
+        if track<0: raise ValueError("Аудіодоріжку не знайдено")
+        rate=int(fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+        channels=int(fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+        extractor.selectTrack(track)
+        codec=MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME))
+        codec.configure(fmt,None,None,0); codec.start()
+        info=MediaCodec.BufferInfo(); input_done=False; output_done=False
+        while not output_done:
+            if not input_done:
+                ix=codec.dequeueInputBuffer(10000)
+                if ix>=0:
+                    ib=codec.getInputBuffer(ix); ib.clear()
+                    n=extractor.readSampleData(ib,0)
+                    if n<0:
+                        codec.queueInputBuffer(ix,0,0,0,MediaCodec.BUFFER_FLAG_END_OF_STREAM); input_done=True
+                    else:
+                        codec.queueInputBuffer(ix,0,n,extractor.getSampleTime(),0); extractor.advance()
+            ox=codec.dequeueOutputBuffer(info,10000)
+            if ox>=0:
+                if info.size>0:
+                    ob=codec.getOutputBuffer(ox); ob.position(info.offset); ob.limit(info.offset+info.size)
+                    b=bytearray(info.size); ob.get(b,0,info.size); chunks.append(bytes(b))
+                if info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM: output_done=True
+                codec.releaseOutputBuffer(ox,False)
+            elif ox==MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                of=codec.getOutputFormat()
+                rate=int(of.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+                channels=int(of.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+                try: encoding=int(of.getInteger(MediaFormat.KEY_PCM_ENCODING))
+                except Exception: encoding=2
+        raw=b"".join(chunks)
+        if not raw: raise ValueError("Декодер повернув порожній файл")
+        samples=array("h")
+        if encoding==4:
+            n=len(raw)//4
+            for x in struct.unpack("<"+"f"*n,raw[:n*4]):
+                samples.append(int(max(-1.0,min(1.0,x))*32767))
+        else:
+            raw=raw[:len(raw)//2*2]; samples.frombytes(raw)
+        if channels>1:
+            mono=array("h")
+            for i in range(0,len(samples)-channels+1,channels):
+                mono.append(int(sum(samples[i:i+channels])/channels))
+            samples=mono
+        if rate!=target_rate and samples:
+            ratio=rate/float(target_rate); count=max(1,int(len(samples)/ratio)); out=array("h")
+            for i in range(count):
+                p=i*ratio; a=min(int(p),len(samples)-1); b=min(a+1,len(samples)-1)
+                out.append(int(samples[a]+(samples[b]-samples[a])*(p-a)))
+            samples=out
+        return samples
+    finally:
+        try:
+            if codec: codec.stop(); codec.release()
+        except Exception: pass
+        try: extractor.release()
+        except Exception: pass
+
+class Mixer:
+    # Telegram voice-note recording is 16 kHz mono PCM; WebRTC capture is
+    # normally 48 kHz PCM. Keep independent playback cursors so one hook
+    # cannot consume the sound before the other audio path receives it.
+    def __init__(self):
+        self.lock=threading.RLock()
+        self.cache={}
+        self.target_rate=16000
+        self.voices={str(rate):[] for rate in (8000,16000,32000,44100,48000)}
+    def play(self,path,gain=1.0):
+        def worker():
+            try:
+                prepared={}
+                for rate in (8000,16000,32000,44100,48000):
+                    stream=str(rate)
+                    key=(path,rate)
+                    data=self.cache.get(key)
+                    if data is None:
+                        data=decode_audio(path,rate)
+                        with self.lock: self.cache[key]=data
+                    if data: prepared[stream]=data
+                if prepared:
+                    with self.lock:
+                        for stream,data in prepared.items():
+                            self.voices[stream].append([data,0,float(gain)])
+                    log("SoundPad: audio decoded for rates: "+",".join(sorted(prepared.keys())))
+                else:
+                    log("SoundPad: decoded audio is empty: "+str(path))
+            except Exception as e:
+                log("SoundPad decode/play: "+str(e))
+        threading.Thread(target=worker,daemon=True).start()
+    def stop(self):
+        with self.lock:
+            self.voices={str(rate):[] for rate in (16000,32000,44100,48000)}
+    def mix(self,raw,stream):
+        n=len(raw)//2*2
+        if not n:return raw
+        out=array("h"); out.frombytes(raw[:n])
+        with self.lock:
+            alive=[]
+            voices=self.voices.get(stream,[])
+            for data,pos,gain in voices:
+                count=min(len(out),len(data)-pos)
+                for i in range(max(0,count)):
+                    out[i]=max(-32768,min(32767,int(out[i]+data[pos+i]*gain)))
+                pos+=max(0,count)
+                if pos<len(data):alive.append([data,pos,gain])
+            self.voices[stream]=alive
+        return out.tobytes()+raw[n:]
+mixer=Mixer()
+
+class RecordFrameHook(MethodHook):
+    _logged_first=False
+    def before_hooked_method(self,p):
+        buf=None
+        old_pos=0
+        old_limit=0
+        try:
+            buf=p.args[0]
+            requested=int(p.args[1])
+            capacity=int(buf.capacity())
+            length=min(requested,capacity)
+            if length<=0:return
+            old_pos=int(buf.position()); old_limit=int(buf.limit())
+            buf.position(0); buf.limit(length)
+            raw=bytearray(length); buf.get(raw,0,length)
+            source=bytes(raw); mixed=mixer.mix(source,str(mixer.target_rate))
+            if mixed!=source:
+                buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
+            if not RecordFrameHook._logged_first:
+                RecordFrameHook._logged_first=True
+                log("SoundPad: MediaController.writeFrame працює; bytes=%d active=%d changed=%s"%(length,len(mixer.voices),str(mixed!=source)))
+        except Exception as e:
+            log("SoundPad writeFrame hook error: "+str(e))
+        finally:
+            if buf is not None:
+                try:
+                    buf.limit(old_limit); buf.position(old_pos)
+                except Exception: pass
+
+class VoipAudioHook(MethodHook):
+    _logged_first=False
+    def before_hooked_method(self,p):
+        buf=None
+        old_pos=0
+        old_limit=0
+        try:
+            size=int(p.args[0])
+            if size<=0:return
+            instance=p.thisObject
+            cls=instance.getClass()
+            field=None
+            while cls is not None and field is None:
+                try:
+                    field=cls.getDeclaredField("byteBuffer")
+                    field.setAccessible(True)
+                except Exception:
+                    try: cls=cls.getSuperclass()
+                    except Exception: cls=None
+            if field is None:
+                raise RuntimeError("byteBuffer field not found in WebRTC recorder")
+            buf=field.get(instance)
+            if buf is None:return
+            length=min(size,int(buf.capacity()))
+            if length<=0:return
+            old_pos=int(buf.position()); old_limit=int(buf.limit())
+            buf.position(0); buf.limit(length)
+            raw=bytearray(length); buf.get(raw,0,length)
+            source=bytes(raw); mixed=mixer.mix(source,"48000")
+            if mixed!=source:
+                buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
+            if not VoipAudioHook._logged_first:
+                VoipAudioHook._logged_first=True
+                log("SoundPad: WebRTC microphone hook works; bytes=%d active=%d changed=%s"%(length,len(mixer.voices),str(mixed!=source)))
+        except Exception as e:
+            log("SoundPad WebRTC hook error: "+str(e))
+        finally:
+            if buf is not None:
+                try:
+                    buf.limit(old_limit if old_limit>0 else int(buf.capacity()))
+                    buf.position(old_pos)
+                except Exception: pass
+
+
+class AudioRecordReadHook(MethodHook):
+    _logged_rates=set()
+    def after_hooked_method(self,p):
+        buf=None
+        old_pos=0
+        old_limit=0
+        try:
+            read_count=int(p.getResult())
+            if read_count<=0:return
+            buf=p.args[0]
+            if buf is None:return
+            rate=int(p.thisObject.getSampleRate())
+            stream=str(min((8000,16000,32000,44100,48000),key=lambda x:abs(x-rate)))
+            length=min(read_count,int(buf.capacity()))
+            length-=length%2
+            if length<=0:return
+            old_pos=int(buf.position()); old_limit=int(buf.limit())
+            buf.position(0); buf.limit(length)
+            from java import jarray, jbyte
+            java_in=jarray(jbyte)(length)
+            buf.get(java_in,0,length)
+            source=bytes((int(v)&255 for v in java_in))
+            mixed=mixer.mix(source,stream)
+            if mixed!=source:
+                java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
+                buf.position(0)
+                buf.put(java_out,0,min(length,len(java_out)))
+            if rate not in AudioRecordReadHook._logged_rates:
+                AudioRecordReadHook._logged_rates.add(rate)
+                log("SoundPad: AudioRecord.read active; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
+        except Exception as e:
+            log("SoundPad AudioRecord.read hook error: "+str(e))
+        finally:
+            if buf is not None:
+                try:
+                    buf.limit(old_limit if old_limit>0 else int(buf.capacity()))
+                    buf.position(old_pos)
+                except Exception: pass
+
+class DragListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self,panel):
+        super().__init__(); self.panel=panel; self.x=0; self.y=0; self.moved=False
+    def onTouch(self,v,event):
+        action=event.getAction()
+        if action==MotionEvent.ACTION_DOWN:
+            self.x=float(event.getRawX()); self.y=float(event.getRawY()); self.moved=False; return True
+        if action==MotionEvent.ACTION_MOVE:
+            nx=float(event.getRawX()); ny=float(event.getRawY())
+            if abs(nx-self.x)>3 or abs(ny-self.y)>3:self.moved=True
+            self.panel.move_to(int(nx-self.x),int(ny-self.y)); self.x=nx; self.y=ny; return True
+        if action==MotionEvent.ACTION_UP:
+            if not self.moved and self.panel.collapsed:self.panel.expand()
+            return True
+        return True
+
+class Panel:
+    def __init__(self,plugin):
+        self.plugin=plugin; self.root=None; self.container=None; self.visible=False
+        self.page=0; self.collapsed=False; self.overlay=False; self.wm=None
+    def shape(self,color,radius=12,stroke=None):
+        from android.graphics.drawable import GradientDrawable
+        d=GradientDrawable(); d.setColor(color); d.setCornerRadius(float(radius))
+        if stroke is not None:
+            try:d.setStroke(2,stroke)
+            except Exception:pass
+        return d
+    def button(self,ctx,label,fn,color):
+        b=TextView(ctx); b.setText(label); b.setTextColor(Color.rgb(235,248,255)); b.setTextSize(12)
+        b.setGravity(Gravity.CENTER); b.setPadding(7,7,7,7)
+        b.setBackground(self.shape(color,10,Color.rgb(0,220,255)))
+        b.setOnClickListener(OnClickListener(lambda v:fn())); return b
+    def build(self,ctx):
+        card=LinearLayout(ctx); card.setOrientation(1); card.setPadding(9,8,9,8)
+        card.setBackground(self.shape(Color.rgb(16,13,34),18,Color.rgb(0,220,255))); card.setElevation(12.0)
+        head=LinearLayout(ctx); head.setOrientation(0); head.setGravity(Gravity.CENTER_VERTICAL)
+        title=TextView(ctx); title.setText("🔊 SoundPad  ·  %d/4"%(self.page+1))
+        title.setTextColor(Color.rgb(0,245,255)); title.setTextSize(14); title.setPadding(8,5,8,8)
+        title.setOnTouchListener(DragListener(self)); head.addView(title,LinearLayout.LayoutParams(0,-2,1.0))
+        head.addView(self.button(ctx,"−",self.collapse,Color.rgb(65,70,82)),LinearLayout.LayoutParams(42,-2))
+        card.addView(head)
+        for rowno in range(2):
+            row=LinearLayout(ctx); row.setOrientation(0)
+            for col in range(4):
+                i=self.page*8+rowno*4+col
+                name=self.plugin.get_setting("slot_%d_label"%i,"Звук %d"%(i+1))
+                file=self.plugin.get_setting("slot_%d_file"%i,"")
+                enabled=self.plugin.get_setting("slot_%d_enabled"%i,True)
+                btn=TextView(ctx); btn.setText(str(name) if file and enabled else "＋ %d"%(i+1))
+                btn.setTextColor(Color.rgb(245,250,255)); btn.setTextSize(12); btn.setGravity(Gravity.CENTER)
+                btn.setSingleLine(True); btn.setMaxLines(1); btn.setHorizontallyScrolling(True); btn.setIncludeFontPadding(False); btn.setMinHeight(50); btn.setMaxHeight(50); btn.setPadding(2,0,2,0)
+                try:
+                    from android.text import TextUtils
+                    btn.setEllipsize(TextUtils.TruncateAt.END)
+                except Exception:pass
+                try:
+                    # Android auto-size shrinks long labels to fit the available button width.
+                    btn.setAutoSizeTextTypeUniformWithConfiguration(6,11,1,2)
+                except Exception:
+                    pass
+                active=bool(file and enabled)
+                btn.setBackground(self.shape(Color.rgb(31,25,65) if active else Color.rgb(27,23,42),11,
+                                             Color.rgb(0,235,255) if active else Color.rgb(175,55,230)))
+                if file and enabled:btn.setOnClickListener(OnClickListener(lambda v,n=i:self.plugin.play_slot(n)))
+                lp=LinearLayout.LayoutParams(0,50,1.0); lp.setMargins(3,3,3,3); row.addView(btn,lp)
+            card.addView(row)
+        controls=LinearLayout(ctx); controls.setOrientation(0)
+        for label,fn,col in [("‹",lambda:self.change(-1),Color.rgb(43,31,88)),("⏹ СТОП",self.plugin.stop_all,Color.rgb(115,25,70)),("›",lambda:self.change(1),Color.rgb(43,31,88)),("✕",self.close_soundpad,Color.rgb(105,18,58))]:
+            btn=self.button(ctx,label,fn,col); lp=LinearLayout.LayoutParams(0,-2,1.0)
+            lp.setMargins(3,7,3,0); controls.addView(btn,lp)
+        card.addView(controls); return card
+    def build_collapsed(self,ctx):
+        v=TextView(ctx); v.setText("🔊"); v.setTextSize(22); v.setTextColor(Color.rgb(0,245,255))
+        v.setGravity(Gravity.CENTER); v.setBackground(self.shape(Color.rgb(16,13,34),30,Color.rgb(0,220,255)))
+        v.setElevation(10.0); v.setOnTouchListener(DragListener(self)); return v
+    def make_container(self,ctx):
+        self.container=FrameLayout(ctx)
+        self.container.addView(self.build_collapsed(ctx) if self.collapsed else self.build(ctx))
+    def allowed(self):
+        try:
+            from android.provider import Settings
+            return bool(Settings.canDrawOverlays(self.plugin.get_context()))
+        except Exception:return False
+    def show_overlay(self):
+        from android.view import WindowManager
+        from android.graphics import PixelFormat
+        ctx=self.plugin.get_context(); self.wm=ctx.getSystemService(ctx.WINDOW_SERVICE)
+        self.make_container(ctx)
+        typ=WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        flags=WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        lp=WindowManager.LayoutParams(-2,-2,typ,flags,PixelFormat.TRANSLUCENT)
+        lp.gravity=Gravity.TOP|Gravity.LEFT
+        lp.x=int(self.plugin.get_setting("panel_x",12)); lp.y=int(self.plugin.get_setting("panel_y",140))
+        self.wm.addView(self.container,lp); self.visible=True; self.overlay=True
+    def show(self):
+        mode=int(self.plugin.get_setting("display_mode",0) or 0)
+        if self.visible:
+            if self.overlay==(mode==1):self.refresh(); return
+            self.hide()
+        if mode==1:
+            if not self.allowed():
+                self.plugin.notify("Потрібен дозвіл «Показ поверх інших програм» для ExteraGram.")
+                self.plugin.open_overlay_permission(); return
+            try:self.show_overlay()
+            except Exception as e:
+                log("SoundPad overlay: "+str(e)); self.plugin.notify("Помилка плаваючої панелі: "+str(e))
+            return
+        act=self.plugin.get_activity()
+        if act is None:return
+        try:
+            from android import R as AR
+            self.root=act.getWindow().getDecorView().findViewById(AR.id.content)
+            self.make_container(act)
+            lp=FrameLayout.LayoutParams(-2,-2); lp.gravity=Gravity.TOP|Gravity.RIGHT
+            lp.topMargin=70; lp.rightMargin=8; self.root.addView(self.container,lp)
+            self.visible=True; self.overlay=False
+        except Exception as e:log("SoundPad panel: "+str(e))
+    def refresh(self):
+        if not self.visible or self.container is None:return
+        try:
+            self.container.removeAllViews()
+            ctx=self.plugin.get_context() if self.overlay else self.plugin.get_activity()
+            self.container.addView(self.build_collapsed(ctx) if self.collapsed else self.build(ctx))
+        except Exception as e:log("SoundPad refresh: "+str(e))
+    def collapse(self):self.collapsed=True; self.refresh()
+    def expand(self):self.collapsed=False; self.refresh()
+    def change(self,d):self.page=(self.page+d)%4; self.refresh()
+    def move_to(self,dx,dy):
+        if not self.visible or self.container is None:return
+        try:
+            if self.overlay:
+                lp=self.container.getLayoutParams(); dm=self.plugin.get_context().getResources().getDisplayMetrics()
+                maxx=max(0,int(dm.widthPixels)-int(self.container.getWidth()))
+                maxy=max(0,int(dm.heightPixels)-int(self.container.getHeight()))
+                lp.x=max(0,min(maxx,int(lp.x+dx))); lp.y=max(0,min(maxy,int(lp.y+dy)))
+                self.wm.updateViewLayout(self.container,lp)
+                self.plugin.set_setting("panel_x",int(lp.x)); self.plugin.set_setting("panel_y",int(lp.y))
+            else:
+                self.container.setTranslationX(int(self.container.getTranslationX()+dx))
+                self.container.setTranslationY(int(self.container.getTranslationY()+dy))
+        except Exception as e:log("SoundPad drag: "+str(e))
+    def close_soundpad(self):
+        # Suspend SoundPad until the next foreground entry. Hooks stay installed
+        # so the ResumeHook can reactivate the plugin when ExteraGram is reopened.
+        self.plugin.closed_until_resume=True
+        try:mixer.stop()
+        except Exception:pass
+        self.hide()
+    def hide(self):
+        try:
+            if self.visible and self.overlay and self.wm is not None:self.wm.removeView(self.container)
+            elif self.visible and self.root is not None:self.root.removeView(self.container)
+        except Exception:pass
+        self.root=None; self.container=None; self.wm=None; self.visible=False; self.overlay=False
+
+class RecordStartHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def after_hooked_method(self,param):
+        try: mixer.target_rate=int(param.args[1])
+        except Exception: mixer.target_rate=RATE
+        self.p.show_panel()
+class RecordStopHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def before_hooked_method(self,param): mixer.stop(); self.p.hide_panel()
+class VoipStateHook(MethodHook):
+    def __init__(self,p,est,ends): self.p=p; self.est=est; self.ends=ends
+    def after_hooked_method(self,param):
+        try:
+            state=int(param.args[0])
+            if state==self.est: mixer.target_rate=RATE; self.p.show_panel()
+            elif state in self.ends:mixer.stop(); self.p.hide_panel()
+        except Exception as e: log("SoundPad call state: "+str(e))
+class ResumeHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def after_hooked_method(self,param):
+        self.p.activity=param.thisObject
+        # Reactivate after X and show on every foreground entry.
+        self.p.closed_until_resume=False
+        self.p.show_panel()
+class PauseHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def before_hooked_method(self,param):
+        if int(self.p.get_setting("display_mode",0) or 0)==0:self.p.hide_panel()
+class ImportHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def before_hooked_method(self,param):
+        try:
+            request_code=int(param.args[0])
+            result_code=int(param.args[1])
+            log("SoundPad: onActivityResult request=%d result=%d"%(request_code,result_code))
+            if request_code!=IMPORT_CODE:return
+            if result_code!=-1:
+                log("SoundPad: file picker cancelled or returned non-OK result")
+                return
+            data=param.args[2]
+            if data is None or data.getData() is None:
+                self.p.notify("Файловий менеджер не повернув вибраний файл")
+                return
+            resolver=self.p.get_context().getContentResolver(); uri=data.getData()
+            stream=resolver.openInputStream(uri); name="sound_%d.audio"%int(time.time())
+            try:
+                cur=resolver.query(uri,None,None,None,None)
+                if cur is not None:
+                    try:
+                        if cur.moveToFirst():
+                            from android.provider import OpenableColumns
+                            ix=cur.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if ix>=0:name=str(cur.getString(ix))
+                    finally:cur.close()
+            except Exception:pass
+            safe="".join(c if c.isalnum() or c in "._-" else "_" for c in name) or "sound.audio"
+            dest=os.path.join(sounds_dir(),safe); base,ext=os.path.splitext(dest); n=1
+            while os.path.exists(dest):dest="%s_%d%s"%(base,n,ext); n+=1
+            from java import jarray, jbyte
+            buffer=jarray(jbyte)(65536)
+            try:
+                with open(dest,"wb") as out:
+                    while True:
+                        count=int(stream.read(buffer))
+                        if count<0: break
+                        if count==0: continue
+                        out.write(bytes(buffer[:count]))
+            finally:
+                stream.close()
+            log("SoundPad: imported file %s (%d bytes) into %s" % (safe, os.path.getsize(dest), sounds_dir()))
+            # Rebuild settings on the UI thread so Selector.items is regenerated
+            # from the newly imported directory contents.
+            run_on_ui_thread(self.p.refresh_settings)
+            self.p.notify("Імпортовано: "+os.path.basename(dest))
+        except Exception as e:
+            log("SoundPad import error: "+str(e))
+            self.p.notify("Не вдалося імпортувати файл: "+str(e))
+
+class SoundPadPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.activity=None; self.panel=Panel(self); self.unhooks=[]; self.closed_until_resume=False
+        try: external_sounds_dir()
+        except Exception as e: log("SoundPad folder create: "+str(e))
+        if self.get_setting("enabled",True):self.install_hooks()
+        # Do not depend only on LaunchActivity.onResume: plugin loading can happen
+        # after that callback. In overlay mode the application context is enough.
+        self.show_panel()
+        log("SoundPad loaded; startup panel requested")
+    def on_app_event(self,event_type):
+        try:
+            if event_type in (AppEvent.START,AppEvent.RESUME):
+                self.closed_until_resume=False
+                self.show_panel()
+            elif event_type in (AppEvent.STOP,AppEvent.PAUSE):
+                if int(self.get_setting("display_mode",0) or 0)==0:
+                    self.hide_panel()
+        except Exception as e:
+            log("SoundPad app lifecycle: "+str(e))
+    def get_context(self):
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            return ApplicationLoader.applicationContext
+        except Exception:return None
+    def get_activity(self):
+        if self.activity is not None:
+            try:
+                if not self.activity.isFinishing() and not self.activity.isDestroyed():return self.activity
+            except Exception: pass
+        try:
+            from java.lang import Class as JClass
+            at=JClass.forName("android.app.ActivityThread")
+            current=at.getMethod("currentActivityThread").invoke(None)
+            fld=at.getDeclaredField("mActivities"); fld.setAccessible(True)
+            records=fld.get(current).values().iterator()
+            while records.hasNext():
+                record=records.next(); rc=record.getClass()
+                paused=rc.getDeclaredField("paused"); paused.setAccessible(True)
+                if paused.getBoolean(record):continue
+                af=rc.getDeclaredField("activity"); af.setAccessible(True)
+                activity=af.get(record)
+                if activity is not None:
+                    self.activity=activity
+                    return activity
+        except Exception as e:log("SoundPad current Activity lookup: "+str(e))
+        return None
+    def notify(self,msg):
+        try:
+            from ui.bulletin import BulletinHelper
+            run_on_ui_thread(lambda:BulletinHelper.show_info(msg))
+        except Exception:log(msg)
+    def hook(self,cls,name,types,handler):
+        try:
+            # getMethod only finds public methods. Android Activity callbacks
+            # are often protected, and may be declared by a superclass.
+            current=cls
+            m=None
+            while current is not None:
+                try:
+                    m=current.getDeclaredMethod(name,*types)
+                    break
+                except Exception:
+                    try: current=current.getSuperclass()
+                    except Exception: current=None
+            if m is None:
+                raise Exception("Method not found in class hierarchy: "+name)
+            m.setAccessible(True)
+            u=self.hook_method(m,handler)
+            if u:self.unhooks.append(u); log("SoundPad hook: "+name); return True
+        except Exception as e:log("SoundPad hook unavailable "+name+": "+str(e))
+        return False
+    def install_hooks(self):
+        from java.lang import Integer, String, Long
+        from java.nio import ByteBuffer
+        try:
+            c=find_class("org.telegram.messenger.MediaController")
+            if c:
+                self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
+                self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
+                self.hook(c,"stopRecord",[],RecordStopHook(self))
+                log("SoundPad: MediaController recording hooks installed")
+        except Exception as e:log("SoundPad recording hooks: "+str(e))
+        try:
+            for name in ["org.webrtc.voiceengine.WebRtcAudioRecord","org.webrtc.audio.WebRtcAudioRecord","org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord"]:
+                try:
+                    c=find_class(name)
+                    if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):
+                        log("SoundPad: WebRTC audio hook installed: "+name)
+                        break
+                except Exception as e:log("SoundPad WebRTC candidate "+name+": "+str(e))
+        try:
+            c=find_class("org.telegram.ui.LaunchActivity")
+            if c:
+                from android.content import Intent
+                resume_hook=ResumeHook(self)
+                self.hook(c,"onResume",[],resume_hook)
+                # onPostResume is a second lifecycle checkpoint. It covers cases
+                # where the plugin initializes while LaunchActivity is already
+                # being resumed and guarantees the overlay is restored after relaunch.
+                self.hook(c,"onPostResume",[],ResumeHook(self))
+                self.hook(c,"onPause",[],PauseHook(self))
+                self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
+        except Exception as e:log("SoundPad import hooks: "+str(e))
+        try:
+            c=find_class("org.telegram.messenger.voip.VoIPService")
+            if c:
+                def read(name,default):
+                    try:
+                        f=c.getDeclaredField(name); f.setAccessible(True); return int(f.getInt(None))
+                    except Exception:return default
+                est=read("STATE_ESTABLISHED",3)
+                ends={read("STATE_ENDED",11),read("STATE_FAILED",4),read("STATE_BUSY",17),read("STATE_HANGING_UP",10)}
+                self.hook(c,"dispatchStateChanged",[Integer.TYPE],VoipStateHook(self,est,ends))
+        except Exception as e:log("SoundPad VoIP state: "+str(e))
+
+    def play_slot(self,i):
+        if self.closed_until_resume:return
+        name=self.get_setting("slot_%d_file"%i,"")
+        path=os.path.join(sounds_dir(),name) if name else ""
+        if not path or not os.path.isfile(path):self.notify("Спочатку вибери аудіофайл"); return
+        gain=float(self.get_setting("slot_%d_gain"%i,100))/100.0
+        mixer.play(path,gain)
+    def stop_all(self):mixer.stop()
+    def show_panel(self):
+        if self.get_setting("enabled",True) and not self.closed_until_resume:run_on_ui_thread(self.panel.show)
+    def hide_panel(self):run_on_ui_thread(self.panel.hide)
+    def open_overlay_permission(self,view=None):
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            from android.provider import Settings
+            ctx=self.get_context()
+            intent=Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:"+ctx.getPackageName()))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+        except Exception as e:
+            log("SoundPad overlay permission: "+str(e)); self.notify("Не вдалося відкрити налаштування дозволу: "+str(e))
+    def change_display_mode(self,value):
+        try:
+            mode=int(value); self.set_setting("display_mode",mode)
+            run_on_ui_thread(self.panel.hide)
+            if mode==1 and not self.panel.allowed():
+                self.notify("Надай ExteraGram дозвіл «Показ поверх інших програм».")
+                self.open_overlay_permission()
+            else:self.show_panel()
+        except Exception as e:log("SoundPad display mode: "+str(e))
+    def open_picker(self,view):
+        try:
+            # Resolve the live Activity from the settings row itself. The plugin
+            # may be opened while LaunchActivity is already resumed, so an
+            # onResume hook alone is not a reliable source of the Activity.
+            ctx = view.getContext() if view is not None else None
+            activity = None
+            for _ in range(12):
+                if ctx is None: break
+                try:
+                    ctx.startActivityForResult
+                    activity = ctx
+                    break
+                except Exception:
+                    try: ctx = ctx.getBaseContext()
+                    except Exception: break
+            if activity is None:
+                self.notify("Не вдалося отримати вікно ExteraGram. Закрий налаштування й відкрий їх знову.")
+                return
+            self.activity = activity
+            from android.content import Intent
+            it=Intent(Intent.ACTION_OPEN_DOCUMENT)
+            it.addCategory(Intent.CATEGORY_OPENABLE)
+            it.setType("audio/*")
+            activity.startActivityForResult(it,IMPORT_CODE)
+        except Exception as e:
+            log("SoundPad picker: "+str(e))
+            self.notify("Помилка відкриття файлів: "+str(e))
+    def refresh_settings(self):
+        try:self.set_setting("_refresh",str(time.time()),reload_settings=True)
+        except Exception:pass
+    def create_settings(self)->List[Any]:
+        sync_external_sounds()
+        files=sorted(f for f in os.listdir(sounds_dir()) if os.path.isfile(os.path.join(sounds_dir(),f)))
+        choices=["— не вибрано —"]+files
+        rows=[Header(text="SoundPad · 32 звуки"),
+              Switch(key="enabled",text="Увімкнути плагін",default=True),
+              Header(text="Плаваюча панель"),
+              Selector(key="display_mode",text="Режим показу",default=int(self.get_setting("display_mode",0) or 0),
+                       items=["Тільки в Telegram","Поверх усіх програм"],on_change=self.change_display_mode),
+              Text(text="Для показу поверх інших програм потрібен дозвіл Android.",
+                   icon="msg_settings",on_click=self.open_overlay_permission),
+              Text(text="Кнопка «−» згортає панель у 🔊. Натисни 🔊, щоб розгорнути."),
+              Text(text="Звуки автоматично беруться з Download/exterasounds. Підтримка: MP3, WAV, OGG, M4A, AAC, FLAC, 3GP, OPUS."),
+              Text(text="Папка: /storage/emulated/0/Download/exterasounds"),
+              Text(text="＋ ОНОВИТИ СПИСОК ЗВУКІВ",icon="msg_retry",on_click=lambda v:self.refresh_settings()),
+              Text(text="＋ ІМПОРТУВАТИ АУДІО (старий спосіб)",icon="msg_addbot",on_click=self.open_picker),
+              Divider()]
+        for i in range(SLOTS):
+            current=self.get_setting("slot_%d_file"%i,"")
+            idx=files.index(current)+1 if current in files else 0
+            rows += [Header(text="Кнопка %d"%(i+1)),
+                     Input(key="slot_%d_label"%i,text="Назва",default="Звук %d"%(i+1)),
+                     Selector(key="slot_%d_select_%d"%(i,len(files)),text="Файл",default=idx,items=choices,
+                         on_change=lambda v,n=i,fs=files:self.set_setting("slot_%d_file"%n,fs[v-1] if v>0 and v<=len(fs) else "")),
+                     Switch(key="slot_%d_enabled"%i,text="Показувати кнопку",default=True),
+                     Input(key="slot_%d_gain"%i,text="Гучність (%)",default="100"),Divider()]
+        return rows
+    def on_plugin_unload(self):
+        mixer.stop(); self.panel.hide()
+        for u in self.unhooks:
+            try:self.unhook_method(u)
+            except Exception:pass
+        self.unhooks=[]
