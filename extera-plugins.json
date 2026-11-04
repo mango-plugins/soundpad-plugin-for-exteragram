@@ -6,28 +6,11 @@
   "homepage": "https://github.com/kostapechonkin-jpg/soundpad-plugin-for-exteragram",
   "plugins": [
     {
-      "id": "soundpad",
-      "name": "SoundPad",
-      "description": "32-slot neon soundboard with direct digital audio injection",
-      "author": "@Mango_mango_mango_mango & ChatGPT",
-      "version": "0.4.0_audio_routes",
-      "icon": "exteraPlugins/1",
-      "app_version": ">=13.1.1",
-      "sdk_version": ">=1.4.4.3",
-      "category": [
-        "media",
-        "tools"
-      ],
-      "file": "plugins/soundpad/soundpad.plugin",
-      "sha256": "e2e8d0ee87970f2b6df1f43ec77b2ae458ce5742e5a4ac21ec4a3bc2fc8b406c",
-      "size": 37846
-    },
-    {
       "id": "soundpad_reloaded",
       "name": "SoundPad Reloaded",
-      "description": "Standalone renamed copy of SoundPad for ExteraGram",
+      "description": "32-slot soundboard for voice messages, video notes and calls",
       "author": "@Mango_mango_mango_mango & ChatGPT",
-      "version": "0.4.1_reloaded",
+      "version": "0.4.2",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -36,8 +19,8 @@
         "tools"
       ],
       "file": "plugins/soundpad/soundpad_reloaded.plugin",
-      "sha256": "67f50f668b0e75920441e838fdb676a2d6ead2c612be37dac91b4c4c85fdb785",
-      "size": 37860
+      "sha256": "db0388d446321af32263fd4588f3a3145f4d4195097147d7f9c3f494ceb50bad",
+      "size": 37842
     }
   ]
 }
