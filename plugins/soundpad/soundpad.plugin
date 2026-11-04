@@ -13,9 +13,9 @@ from android.widget import FrameLayout, LinearLayout, TextView
 
 __id__ = "soundpad"
 __name__ = "SoundPad"
-__description__ = "32-slot floating soundboard for voice messages and calls"
+__description__ = "32-slot floating soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.3.9_pcmfix"
+__version__ = "0.4.0_audio_routes"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -136,12 +136,13 @@ class Mixer:
     def __init__(self):
         self.lock=threading.RLock()
         self.cache={}
-        self.voices={str(rate):[] for rate in (16000,32000,44100,48000)}
+        self.target_rate=16000
+        self.voices={str(rate):[] for rate in (8000,16000,32000,44100,48000)}
     def play(self,path,gain=1.0):
         def worker():
             try:
                 prepared={}
-                for rate in (16000,32000,44100,48000):
+                for rate in (8000,16000,32000,44100,48000):
                     stream=str(rate)
                     key=(path,rate)
                     data=self.cache.get(key)
@@ -194,7 +195,7 @@ class RecordFrameHook(MethodHook):
             old_pos=int(buf.position()); old_limit=int(buf.limit())
             buf.position(0); buf.limit(length)
             raw=bytearray(length); buf.get(raw,0,length)
-            source=bytes(raw); mixed=mixer.mix(source,"record")
+            source=bytes(raw); mixed=mixer.mix(source,str(mixer.target_rate))
             if mixed!=source:
                 buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
             if not RecordFrameHook._logged_first:
@@ -236,7 +237,7 @@ class VoipAudioHook(MethodHook):
             old_pos=int(buf.position()); old_limit=int(buf.limit())
             buf.position(0); buf.limit(length)
             raw=bytearray(length); buf.get(raw,0,length)
-            source=bytes(raw); mixed=mixer.mix(source,"voip")
+            source=bytes(raw); mixed=mixer.mix(source,"48000")
             if mixed!=source:
                 buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
             if not VoipAudioHook._logged_first:
@@ -264,7 +265,7 @@ class AudioRecordReadHook(MethodHook):
             buf=p.args[0]
             if buf is None:return
             rate=int(p.thisObject.getSampleRate())
-            stream=str(min((16000,32000,44100,48000),key=lambda x:abs(x-rate)))
+            stream=str(min((8000,16000,32000,44100,48000),key=lambda x:abs(x-rate)))
             length=min(read_count,int(buf.capacity()))
             length-=length%2
             if length<=0:return
@@ -341,14 +342,14 @@ class Panel:
                 enabled=self.plugin.get_setting("slot_%d_enabled"%i,True)
                 btn=TextView(ctx); btn.setText(str(name) if file and enabled else "＋ %d"%(i+1))
                 btn.setTextColor(Color.rgb(245,250,255)); btn.setTextSize(12); btn.setGravity(Gravity.CENTER)
-                btn.setSingleLine(True); btn.setMaxLines(1); btn.setHorizontallyScrolling(True); btn.setPadding(3,4,3,4)
+                btn.setSingleLine(True); btn.setMaxLines(1); btn.setHorizontallyScrolling(True); btn.setIncludeFontPadding(False); btn.setMinHeight(50); btn.setMaxHeight(50); btn.setPadding(2,0,2,0)
                 try:
                     from android.text import TextUtils
                     btn.setEllipsize(TextUtils.TruncateAt.END)
                 except Exception:pass
                 try:
                     # Android auto-size shrinks long labels to fit the available button width.
-                    btn.setAutoSizeTextTypeUniformWithConfiguration(7,12,1,2)
+                    btn.setAutoSizeTextTypeUniformWithConfiguration(6,11,1,2)
                 except Exception:
                     pass
                 active=bool(file and enabled)
@@ -549,7 +550,28 @@ class SoundPadPlugin(BasePlugin):
             from org.telegram.messenger import ApplicationLoader
             return ApplicationLoader.applicationContext
         except Exception:return None
-    def get_activity(self):return self.activity
+    def get_activity(self):
+        if self.activity is not None:
+            try:
+                if not self.activity.isFinishing() and not self.activity.isDestroyed():return self.activity
+            except Exception: pass
+        try:
+            from java.lang import Class as JClass
+            at=JClass.forName("android.app.ActivityThread")
+            current=at.getMethod("currentActivityThread").invoke(None)
+            fld=at.getDeclaredField("mActivities"); fld.setAccessible(True)
+            records=fld.get(current).values().iterator()
+            while records.hasNext():
+                record=records.next(); rc=record.getClass()
+                paused=rc.getDeclaredField("paused"); paused.setAccessible(True)
+                if paused.getBoolean(record):continue
+                af=rc.getDeclaredField("activity"); af.setAccessible(True)
+                activity=af.get(record)
+                if activity is not None:
+                    self.activity=activity
+                    return activity
+        except Exception as e:log("SoundPad current Activity lookup: "+str(e))
+        return None
     def notify(self,msg):
         try:
             from ui.bulletin import BulletinHelper
@@ -581,13 +603,19 @@ class SoundPadPlugin(BasePlugin):
         try:
             c=find_class("org.telegram.messenger.MediaController")
             if c:
+                self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
                 self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
                 self.hook(c,"stopRecord",[],RecordStopHook(self))
-        except Exception as e:log("SoundPad recording lifecycle hooks: "+str(e))
+                log("SoundPad: MediaController recording hooks installed")
+        except Exception as e:log("SoundPad recording hooks: "+str(e))
         try:
-            from android.media import AudioRecord
-            self.hook(AudioRecord,"read",[ByteBuffer,Integer.TYPE],AudioRecordReadHook())
-        except Exception as e:log("SoundPad AudioRecord hook install error: "+str(e))
+            for name in ["org.webrtc.voiceengine.WebRtcAudioRecord","org.webrtc.audio.WebRtcAudioRecord","org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord"]:
+                try:
+                    c=find_class(name)
+                    if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):
+                        log("SoundPad: WebRTC audio hook installed: "+name)
+                        break
+                except Exception as e:log("SoundPad WebRTC candidate "+name+": "+str(e))
         try:
             c=find_class("org.telegram.ui.LaunchActivity")
             if c:
