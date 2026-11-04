@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -132,46 +132,6 @@ def decode_audio(path, target_rate=RATE):
 class Mixer:
     def __init__(self):
         self.lock=threading.RLock(); self.cache={}; self.voices=[]; self.target_rate=RATE
-        self.monitor_tracks=[]
-    def _play_local(self,data,gain):
-        # Play a local monitor copy too: without this, a missed Telegram audio
-        # hook makes the sound button appear completely silent.
-        track=None
-        try:
-            from android.media import AudioTrack, AudioFormat, AudioManager
-            from java import jarray, jbyte
-            channel=int(AudioFormat.CHANNEL_OUT_MONO)
-            encoding=int(AudioFormat.ENCODING_PCM_16BIT)
-            minimum=int(AudioTrack.getMinBufferSize(int(self.target_rate),channel,encoding))
-            if minimum<=0: minimum=8192
-            track=AudioTrack(int(AudioManager.STREAM_MUSIC),int(self.target_rate),channel,encoding,max(minimum*2,8192),int(AudioTrack.MODE_STREAM))
-            if int(track.getState())!=int(AudioTrack.STATE_INITIALIZED):
-                raise RuntimeError("AudioTrack не ініціалізувався")
-            with self.lock: self.monitor_tracks.append(track)
-            track.play()
-            # Apply the slot volume to the local copy, without changing the
-            # original samples that are injected into the outgoing audio.
-            scaled=array("h",(max(-32768,min(32767,int(x*float(gain)))) for x in data))
-            raw=scaled.tobytes()
-            chunk_size=8192
-            for start in range(0,len(raw),chunk_size):
-                chunk=raw[start:start+chunk_size]
-                if not chunk: continue
-                signed=[b if b<128 else b-256 for b in chunk]
-                arr=jarray(jbyte)(signed)
-                written=int(track.write(arr,0,len(signed)))
-                if written<0: raise RuntimeError("AudioTrack.write повернув "+str(written))
-        except Exception as e:
-            log("SoundPad local playback: "+str(e))
-        finally:
-            if track is not None:
-                try: track.stop()
-                except Exception: pass
-                try: track.release()
-                except Exception: pass
-                with self.lock:
-                    try: self.monitor_tracks.remove(track)
-                    except Exception: pass
     def play(self,path,gain=1.0):
         def worker():
             try:
@@ -181,8 +141,11 @@ class Mixer:
                     data=decode_audio(path,target_rate)
                     with self.lock: self.cache[key]=data
                 if data:
+                    # Digital injection only: the samples are mixed into ExteraGram's
+                    # outgoing microphone/recording buffers by RecordFrameHook/VoipAudioHook.
+                    # Never play them through the phone speaker; that would be re-captured
+                    # acoustically by the microphone and sound like a second phone.
                     with self.lock: self.voices.append([data,0,float(gain)])
-                    threading.Thread(target=self._play_local,args=(data,float(gain)),daemon=True).start()
                 else:
                     log("SoundPad: decoded audio is empty: "+str(path))
             except Exception as e:
@@ -191,10 +154,6 @@ class Mixer:
     def stop(self):
         with self.lock:
             self.voices=[]
-            tracks=list(self.monitor_tracks)
-        for track in tracks:
-            try: track.pause(); track.flush(); track.stop()
-            except Exception: pass
     def mix(self,raw):
         n=len(raw)//2*2
         if not n: return raw
@@ -525,7 +484,12 @@ class SoundPadPlugin(BasePlugin):
             c=find_class("org.telegram.ui.LaunchActivity")
             if c:
                 from android.content import Intent
-                self.hook(c,"onResume",[],ResumeHook(self))
+                resume_hook=ResumeHook(self)
+                self.hook(c,"onResume",[],resume_hook)
+                # onPostResume is a second lifecycle checkpoint. It covers cases
+                # where the plugin initializes while LaunchActivity is already
+                # being resumed and guarantees the overlay is restored after relaunch.
+                self.hook(c,"onPostResume",[],ResumeHook(self))
                 self.hook(c,"onPause",[],PauseHook(self))
                 self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
         except Exception as e:log("SoundPad import hooks: "+str(e))
