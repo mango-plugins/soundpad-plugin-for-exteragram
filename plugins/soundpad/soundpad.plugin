@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -192,31 +192,40 @@ class VoipAudioHook(MethodHook):
 
 class DragListener(dynamic_proxy(View.OnTouchListener)):
     def __init__(self,panel):
-        super().__init__()
-        self.panel=panel; self.x=0; self.y=0; self.sx=0; self.sy=0
+        super().__init__(); self.panel=panel; self.x=0; self.y=0; self.moved=False
     def onTouch(self,v,event):
-        c=self.panel.container
-        if c is None:return False
-        a=event.getAction()
-        if a==MotionEvent.ACTION_DOWN:
-            self.x=float(event.getRawX()); self.y=float(event.getRawY())
-            self.sx=float(c.getTranslationX()); self.sy=float(c.getTranslationY()); return True
-        if a==MotionEvent.ACTION_MOVE:
-            c.setTranslationX(self.sx+float(event.getRawX())-self.x)
-            c.setTranslationY(self.sy+float(event.getRawY())-self.y); return True
+        action=event.getAction()
+        if action==MotionEvent.ACTION_DOWN:
+            self.x=float(event.getRawX()); self.y=float(event.getRawY()); self.moved=False; return True
+        if action==MotionEvent.ACTION_MOVE:
+            nx=float(event.getRawX()); ny=float(event.getRawY())
+            if abs(nx-self.x)>3 or abs(ny-self.y)>3:self.moved=True
+            self.panel.move_to(int(nx-self.x),int(ny-self.y)); self.x=nx; self.y=ny; return True
+        if action==MotionEvent.ACTION_UP:
+            if not self.moved and self.panel.collapsed:self.panel.expand()
+            return True
         return True
 
 class Panel:
     def __init__(self,plugin):
-        self.plugin=plugin; self.root=None; self.container=None; self.visible=False; self.page=0
-    def build(self,ctx):
+        self.plugin=plugin; self.root=None; self.container=None; self.visible=False
+        self.page=0; self.collapsed=False; self.overlay=False; self.wm=None
+    def shape(self,color,radius=12):
         from android.graphics.drawable import GradientDrawable
+        d=GradientDrawable(); d.setColor(color); d.setCornerRadius(float(radius)); return d
+    def button(self,ctx,label,fn,color):
+        b=TextView(ctx); b.setText(label); b.setTextColor(Color.WHITE); b.setTextSize(13)
+        b.setGravity(Gravity.CENTER); b.setPadding(9,8,9,8); b.setBackground(self.shape(color,10))
+        b.setOnClickListener(OnClickListener(lambda v:fn())); return b
+    def build(self,ctx):
         card=LinearLayout(ctx); card.setOrientation(1); card.setPadding(9,8,9,8)
-        bg=GradientDrawable(); bg.setColor(Color.rgb(29,32,41)); bg.setCornerRadius(18.0)
-        card.setBackground(bg); card.setElevation(8.0)
-        head=TextView(ctx); head.setText("🔊 SoundPad  ·  %d/4"%(self.page+1))
-        head.setTextColor(Color.WHITE); head.setTextSize(14); head.setPadding(8,5,8,8)
-        head.setOnTouchListener(DragListener(self)); card.addView(head)
+        card.setBackground(self.shape(Color.rgb(29,32,41),18)); card.setElevation(9.0)
+        head=LinearLayout(ctx); head.setOrientation(0); head.setGravity(Gravity.CENTER_VERTICAL)
+        title=TextView(ctx); title.setText("🔊 SoundPad  ·  %d/4"%(self.page+1))
+        title.setTextColor(Color.WHITE); title.setTextSize(14); title.setPadding(8,5,8,8)
+        title.setOnTouchListener(DragListener(self)); head.addView(title,LinearLayout.LayoutParams(0,-2,1.0))
+        head.addView(self.button(ctx,"−",self.collapse,Color.rgb(65,70,82)),LinearLayout.LayoutParams(42,-2))
+        card.addView(head)
         for rowno in range(2):
             row=LinearLayout(ctx); row.setOrientation(0)
             for col in range(4):
@@ -224,47 +233,94 @@ class Panel:
                 name=self.plugin.get_setting("slot_%d_label"%i,"Звук %d"%(i+1))
                 file=self.plugin.get_setting("slot_%d_file"%i,"")
                 enabled=self.plugin.get_setting("slot_%d_enabled"%i,True)
-                b=TextView(ctx); b.setText(str(name) if file and enabled else "＋ %d"%(i+1))
-                b.setTextColor(Color.WHITE); b.setTextSize(12); b.setGravity(Gravity.CENTER)
-                b.setMaxLines(2); b.setPadding(3,5,3,5)
-                shape=GradientDrawable(); shape.setColor(Color.rgb(48,108,196) if file and enabled else Color.rgb(75,78,87))
-                shape.setCornerRadius(11.0); b.setBackground(shape)
-                if file and enabled:
-                    path=os.path.join(sounds_dir(),file)
-                    gain=float(self.plugin.get_setting("slot_%d_gain"%i,100))/100.0
-                    b.setOnClickListener(OnClickListener(lambda v,n=i:self.plugin.play_slot(n)))
-                lp=LinearLayout.LayoutParams(0,50,1.0); lp.setMargins(3,3,3,3); row.addView(b,lp)
+                btn=TextView(ctx); btn.setText(str(name) if file and enabled else "＋ %d"%(i+1))
+                btn.setTextColor(Color.WHITE); btn.setTextSize(12); btn.setGravity(Gravity.CENTER)
+                btn.setMaxLines(2); btn.setPadding(3,5,3,5)
+                btn.setBackground(self.shape(Color.rgb(48,108,196) if file and enabled else Color.rgb(75,78,87),11))
+                if file and enabled:btn.setOnClickListener(OnClickListener(lambda v,n=i:self.plugin.play_slot(n)))
+                lp=LinearLayout.LayoutParams(0,50,1.0); lp.setMargins(3,3,3,3); row.addView(btn,lp)
             card.addView(row)
         controls=LinearLayout(ctx); controls.setOrientation(0)
-        for title,fn,col in [("‹",lambda:self.change(-1),Color.rgb(65,70,82)),
-                             ("⏹ СТОП",self.plugin.stop_all,Color.rgb(190,55,55)),
-                             ("›",lambda:self.change(1),Color.rgb(65,70,82))]:
-            b=TextView(ctx); b.setText(title); b.setTextColor(Color.WHITE); b.setGravity(Gravity.CENTER)
-            shape=GradientDrawable(); shape.setColor(col); shape.setCornerRadius(10.0); b.setBackground(shape)
-            b.setPadding(8,9,8,9); b.setOnClickListener(OnClickListener(lambda v,f=fn:f()))
-            lp=LinearLayout.LayoutParams(0,-2,1.0); lp.setMargins(3,7,3,0); controls.addView(b,lp)
+        for label,fn,col in [("‹",lambda:self.change(-1),Color.rgb(65,70,82)),("⏹ СТОП",self.plugin.stop_all,Color.rgb(190,55,55)),("›",lambda:self.change(1),Color.rgb(65,70,82))]:
+            btn=self.button(ctx,label,fn,col); lp=LinearLayout.LayoutParams(0,-2,1.0)
+            lp.setMargins(3,7,3,0); controls.addView(btn,lp)
         card.addView(controls); return card
-    def change(self,d):
-        self.page=(self.page+d)%4; self.refresh()
-    def refresh(self):
-        if self.visible and self.container is not None:
-            self.container.removeAllViews(); self.container.addView(self.build(self.plugin.get_activity()))
+    def build_collapsed(self,ctx):
+        v=TextView(ctx); v.setText("🔊"); v.setTextSize(22); v.setTextColor(Color.WHITE)
+        v.setGravity(Gravity.CENTER); v.setBackground(self.shape(Color.rgb(38,75,130),30))
+        v.setElevation(10.0); v.setOnTouchListener(DragListener(self)); return v
+    def make_container(self,ctx):
+        self.container=FrameLayout(ctx)
+        self.container.addView(self.build_collapsed(ctx) if self.collapsed else self.build(ctx))
+    def allowed(self):
+        try:
+            from android.provider import Settings
+            return bool(Settings.canDrawOverlays(self.plugin.get_context()))
+        except Exception:return False
+    def show_overlay(self):
+        from android.view import WindowManager
+        from android.graphics import PixelFormat
+        ctx=self.plugin.get_context(); self.wm=ctx.getSystemService(ctx.WINDOW_SERVICE)
+        self.make_container(ctx)
+        typ=WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        flags=WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        lp=WindowManager.LayoutParams(-2,-2,typ,flags,PixelFormat.TRANSLUCENT)
+        lp.gravity=Gravity.TOP|Gravity.LEFT
+        lp.x=int(self.plugin.get_setting("panel_x",12)); lp.y=int(self.plugin.get_setting("panel_y",140))
+        self.wm.addView(self.container,lp); self.visible=True; self.overlay=True
     def show(self):
-        if self.visible:self.refresh(); return
+        mode=int(self.plugin.get_setting("display_mode",0) or 0)
+        if self.visible:
+            if self.overlay==(mode==1):self.refresh(); return
+            self.hide()
+        if mode==1:
+            if not self.allowed():
+                self.plugin.notify("Потрібен дозвіл «Показ поверх інших програм» для ExteraGram.")
+                self.plugin.open_overlay_permission(); return
+            try:self.show_overlay()
+            except Exception as e:
+                log("SoundPad overlay: "+str(e)); self.plugin.notify("Помилка плаваючої панелі: "+str(e))
+            return
         act=self.plugin.get_activity()
-        if act is None: log("SoundPad: Activity not ready"); return
+        if act is None:return
         try:
             from android import R as AR
             self.root=act.getWindow().getDecorView().findViewById(AR.id.content)
-            self.container=FrameLayout(act); self.container.addView(self.build(act))
-            lp=FrameLayout.LayoutParams(-2,-2); lp.gravity=Gravity.TOP|Gravity.END
-            lp.topMargin=70; lp.rightMargin=8; self.root.addView(self.container,lp); self.visible=True
-        except Exception as e: log("SoundPad panel: "+str(e))
+            self.make_container(act)
+            lp=FrameLayout.LayoutParams(-2,-2); lp.gravity=Gravity.TOP|Gravity.RIGHT
+            lp.topMargin=70; lp.rightMargin=8; self.root.addView(self.container,lp)
+            self.visible=True; self.overlay=False
+        except Exception as e:log("SoundPad panel: "+str(e))
+    def refresh(self):
+        if not self.visible or self.container is None:return
+        try:
+            self.container.removeAllViews()
+            ctx=self.plugin.get_context() if self.overlay else self.plugin.get_activity()
+            self.container.addView(self.build_collapsed(ctx) if self.collapsed else self.build(ctx))
+        except Exception as e:log("SoundPad refresh: "+str(e))
+    def collapse(self):self.collapsed=True; self.refresh()
+    def expand(self):self.collapsed=False; self.refresh()
+    def change(self,d):self.page=(self.page+d)%4; self.refresh()
+    def move_to(self,dx,dy):
+        if not self.visible or self.container is None:return
+        try:
+            if self.overlay:
+                lp=self.container.getLayoutParams(); dm=self.plugin.get_context().getResources().getDisplayMetrics()
+                maxx=max(0,int(dm.widthPixels)-int(self.container.getWidth()))
+                maxy=max(0,int(dm.heightPixels)-int(self.container.getHeight()))
+                lp.x=max(0,min(maxx,int(lp.x+dx))); lp.y=max(0,min(maxy,int(lp.y+dy)))
+                self.wm.updateViewLayout(self.container,lp)
+                self.plugin.set_setting("panel_x",int(lp.x)); self.plugin.set_setting("panel_y",int(lp.y))
+            else:
+                self.container.setTranslationX(int(self.container.getTranslationX()+dx))
+                self.container.setTranslationY(int(self.container.getTranslationY()+dy))
+        except Exception as e:log("SoundPad drag: "+str(e))
     def hide(self):
         try:
-            if self.visible and self.root is not None:self.root.removeView(self.container)
-        except Exception: pass
-        self.root=None; self.container=None; self.visible=False
+            if self.visible and self.overlay and self.wm is not None:self.wm.removeView(self.container)
+            elif self.visible and self.root is not None:self.root.removeView(self.container)
+        except Exception:pass
+        self.root=None; self.container=None; self.wm=None; self.visible=False; self.overlay=False
 
 class RecordStartHook(MethodHook):
     def __init__(self,p): self.p=p
@@ -285,7 +341,13 @@ class VoipStateHook(MethodHook):
         except Exception as e: log("SoundPad call state: "+str(e))
 class ResumeHook(MethodHook):
     def __init__(self,p): self.p=p
-    def after_hooked_method(self,param): self.p.activity=param.thisObject
+    def after_hooked_method(self,param):
+        self.p.activity=param.thisObject
+        self.p.show_panel()
+class PauseHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def before_hooked_method(self,param):
+        if int(self.p.get_setting("display_mode",0) or 0)==0:self.p.hide_panel()
 class ImportHook(MethodHook):
     def __init__(self,p): self.p=p
     def before_hooked_method(self,param):
@@ -389,6 +451,7 @@ class SoundPadPlugin(BasePlugin):
             if c:
                 from android.content import Intent
                 self.hook(c,"onResume",[],ResumeHook(self))
+                self.hook(c,"onPause",[],PauseHook(self))
                 self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
         except Exception as e:log("SoundPad import hooks: "+str(e))
         try:
@@ -417,6 +480,26 @@ class SoundPadPlugin(BasePlugin):
     def show_panel(self):
         if self.get_setting("enabled",True):run_on_ui_thread(self.panel.show)
     def hide_panel(self):run_on_ui_thread(self.panel.hide)
+    def open_overlay_permission(self,view=None):
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            from android.provider import Settings
+            ctx=self.get_context()
+            intent=Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:"+ctx.getPackageName()))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+        except Exception as e:
+            log("SoundPad overlay permission: "+str(e)); self.notify("Не вдалося відкрити налаштування дозволу: "+str(e))
+    def change_display_mode(self,value):
+        try:
+            mode=int(value); self.set_setting("display_mode",mode)
+            run_on_ui_thread(self.panel.hide)
+            if mode==1 and not self.panel.allowed():
+                self.notify("Надай ExteraGram дозвіл «Показ поверх інших програм».")
+                self.open_overlay_permission()
+            else:self.show_panel()
+        except Exception as e:log("SoundPad display mode: "+str(e))
     def open_picker(self,view):
         try:
             # Resolve the live Activity from the settings row itself. The plugin
@@ -454,6 +537,12 @@ class SoundPadPlugin(BasePlugin):
         choices=["— не вибрано —"]+files
         rows=[Header(text="SoundPad · 32 звуки"),
               Switch(key="enabled",text="Увімкнути плагін",default=True),
+              Header(text="Плаваюча панель"),
+              Selector(key="display_mode",text="Режим показу",default=int(self.get_setting("display_mode",0) or 0),
+                       items=["Тільки в Telegram","Поверх усіх програм"],on_change=self.change_display_mode),
+              Text(text="Для показу поверх інших програм потрібен дозвіл Android.",
+                   icon="msg_settings",on_click=self.open_overlay_permission),
+              Text(text="Кнопка «−» згортає панель у 🔊. Натисни 🔊, щоб розгорнути."),
               Text(text="Звуки автоматично беруться з Download/exterasounds. Підтримка: MP3, WAV, OGG, M4A, AAC, FLAC, 3GP, OPUS."),
               Text(text="Папка: /storage/emulated/0/Download/exterasounds"),
               Text(text="＋ ОНОВИТИ СПИСОК ЗВУКІВ",icon="msg_retry",on_click=lambda v:self.refresh_settings()),
