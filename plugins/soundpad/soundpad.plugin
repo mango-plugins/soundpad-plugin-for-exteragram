@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -281,7 +281,11 @@ class ImportHook(MethodHook):
                     chunk=stream.read(65536)
                     if not chunk:break
                     out.write(chunk)
-            stream.close(); self.p.refresh_settings()
+            stream.close()
+            log("SoundPad: imported file %s (%d bytes) into %s" % (safe, os.path.getsize(dest), sounds_dir()))
+            # Rebuild settings on the UI thread so Selector.items is regenerated
+            # from the newly imported directory contents.
+            run_on_ui_thread(self.p.refresh_settings)
             self.p.notify("Імпортовано: "+os.path.basename(dest))
         except Exception as e: log("SoundPad import: "+str(e))
 
@@ -395,7 +399,7 @@ class SoundPadPlugin(BasePlugin):
             idx=files.index(current)+1 if current in files else 0
             rows += [Header(text="Кнопка %d"%(i+1)),
                      Input(key="slot_%d_label"%i,text="Назва",default="Звук %d"%(i+1)),
-                     Selector(key="slot_%d_select"%i,text="Файл",default=idx,items=choices,
+                     Selector(key="slot_%d_select_%d"%(i,len(files)),text="Файл",default=idx,items=choices,
                          on_change=lambda v,n=i,fs=files:self.set_setting("slot_%d_file"%n,fs[v-1] if v>0 and v<=len(fs) else "")),
                      Switch(key="slot_%d_enabled"%i,text="Показувати кнопку",default=True),
                      Input(key="slot_%d_gain"%i,text="Гучність (%)",default="100"),Divider()]
