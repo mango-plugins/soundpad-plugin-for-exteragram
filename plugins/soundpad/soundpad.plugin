@@ -382,8 +382,9 @@ class Panel:
                 self.container.setTranslationY(int(self.container.getTranslationY()+dy))
         except Exception as e:log("SoundPad drag: "+str(e))
     def close_soundpad(self):
-        # The X button stops active playback and hides the panel. Hooks remain
-        # installed so the panel can reappear automatically on the next app entry.
+        # Suspend SoundPad until the next foreground entry. Hooks stay installed
+        # so the ResumeHook can reactivate the plugin when ExteraGram is reopened.
+        self.plugin.closed_until_resume=True
         try:mixer.stop()
         except Exception:pass
         self.hide()
@@ -415,8 +416,8 @@ class ResumeHook(MethodHook):
     def __init__(self,p): self.p=p
     def after_hooked_method(self,param):
         self.p.activity=param.thisObject
-        # Always recreate/show the panel whenever ExteraGram returns to foreground,
-        # even if the user closed it with X during the previous session.
+        # Reactivate after X and show on every foreground entry.
+        self.p.closed_until_resume=False
         self.p.show_panel()
 class PauseHook(MethodHook):
     def __init__(self,p): self.p=p
@@ -474,7 +475,7 @@ class ImportHook(MethodHook):
 
 class SoundPadPlugin(BasePlugin):
     def on_plugin_load(self):
-        self.activity=None; self.panel=Panel(self); self.unhooks=[]
+        self.activity=None; self.panel=Panel(self); self.unhooks=[]; self.closed_until_resume=False
         try: external_sounds_dir()
         except Exception as e: log("SoundPad folder create: "+str(e))
         if self.get_setting("enabled",True):self.install_hooks()
@@ -545,6 +546,7 @@ class SoundPadPlugin(BasePlugin):
                 if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):break
             except Exception:pass
     def play_slot(self,i):
+        if self.closed_until_resume:return
         name=self.get_setting("slot_%d_file"%i,"")
         path=os.path.join(sounds_dir(),name) if name else ""
         if not path or not os.path.isfile(path):self.notify("Спочатку вибери аудіофайл"); return
@@ -552,7 +554,7 @@ class SoundPadPlugin(BasePlugin):
         mixer.play(path,gain)
     def stop_all(self):mixer.stop()
     def show_panel(self):
-        if self.get_setting("enabled",True):run_on_ui_thread(self.panel.show)
+        if self.get_setting("enabled",True) and not self.closed_until_resume:run_on_ui_thread(self.panel.show)
     def hide_panel(self):run_on_ui_thread(self.panel.hide)
     def open_overlay_permission(self,view=None):
         try:
