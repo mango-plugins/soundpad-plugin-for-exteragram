@@ -3,7 +3,7 @@
   "name": "SoundPad Repository",
   "description": "SoundPad plugin for ExteraGram",
   "author": "@Mango_mango_mango_mango & ChatGPT",
-  "homepage": "https://github.com/kostapechonkin-jpg/soundpad-plugin-for-exteragram",
+  "homepage": "https://github.com/mango-plugins/soundpad-plugin-for-exteragram",
   "plugins": [
     {
       "id": "soundpad_reloaded",
