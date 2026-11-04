@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "name": "SoundPad Repository",
+  "description": "SoundPad plugin for ExteraGram",
+  "author": "kostapechonkin-jpg",
+  "homepage": "https://github.com/kostapechonkin-jpg/soundpad-plugin-for-exteragram",
+  "plugins": [
+    {
+      "id": "soundpad",
+      "name": "SoundPad",
+      "description": "32 configurable sound slots with simultaneous local playback",
+      "author": "kostapechonkin-jpg",
+      "version": "0.2.0",
+      "icon": "exteraPlugins/1",
+      "app_version": ">=13.1.1",
+      "sdk_version": ">=1.4.4.3",
+      "category": [
+        "media",
+        "tools"
+      ],
+      "file": "plugins/soundpad/soundpad.plugin",
+      "sha256": "54beb8ab04c5692093dd0cdee5ccdddee3ccacc70eb6c9b131e8d1604a45fa85",
+      "size": 4397
+    }
+  ]
+}
