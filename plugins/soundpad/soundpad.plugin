@@ -1,95 +1,382 @@
+import os, struct, threading, time
+from array import array
 from typing import Any, List
-
-from base_plugin import BasePlugin
-from ui.settings import Header, Divider, Input, Text
-from android.media import MediaPlayer
-from java.io import File
+from base_plugin import BasePlugin, MethodHook
+from android_utils import OnClickListener, run_on_ui_thread, log
+from file_utils import ensure_dir_exists, get_plugins_dir
+from hook_utils import find_class
+from ui.settings import Header, Divider, Input, Selector, Switch, Text
+from android.graphics import Color
+from android.view import Gravity, View, MotionEvent
+from android.widget import FrameLayout, LinearLayout, TextView
 
 __id__ = "soundpad"
 __name__ = "SoundPad"
-__description__ = "32 sound slots with simultaneous local playback."
+__description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.0"
+__version__ = "0.2.0-dev"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
 __category__ = ["media", "tools"]
 
-SLOT_COUNT = 32
+SLOTS, PAGE_SIZE, RATE, IMPORT_CODE = 32, 8, 48000, 42731
 
+def sounds_dir():
+    path=os.path.join(get_plugins_dir(),"soundpad_sounds")
+    ensure_dir_exists(path)
+    return path
+
+def decode_audio(path):
+    from android.media import MediaExtractor, MediaCodec, MediaFormat
+    extractor=MediaExtractor(); codec=None; chunks=[]
+    rate=RATE; channels=1; encoding=2
+    try:
+        extractor.setDataSource(path)
+        track=-1; fmt=None
+        for i in range(extractor.getTrackCount()):
+            f=extractor.getTrackFormat(i); mime=f.getString(MediaFormat.KEY_MIME)
+            if mime and str(mime).startswith("audio/"):
+                track=i; fmt=f; break
+        if track<0: raise ValueError("Аудіодоріжку не знайдено")
+        rate=int(fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+        channels=int(fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+        extractor.selectTrack(track)
+        codec=MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME))
+        codec.configure(fmt,None,None,0); codec.start()
+        info=MediaCodec.BufferInfo(); input_done=False; output_done=False
+        while not output_done:
+            if not input_done:
+                ix=codec.dequeueInputBuffer(10000)
+                if ix>=0:
+                    ib=codec.getInputBuffer(ix); ib.clear()
+                    n=extractor.readSampleData(ib,0)
+                    if n<0:
+                        codec.queueInputBuffer(ix,0,0,0,MediaCodec.BUFFER_FLAG_END_OF_STREAM); input_done=True
+                    else:
+                        codec.queueInputBuffer(ix,0,n,extractor.getSampleTime(),0); extractor.advance()
+            ox=codec.dequeueOutputBuffer(info,10000)
+            if ox>=0:
+                if info.size>0:
+                    ob=codec.getOutputBuffer(ox); ob.position(info.offset); ob.limit(info.offset+info.size)
+                    b=bytearray(info.size); ob.get(b,0,info.size); chunks.append(bytes(b))
+                if info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM: output_done=True
+                codec.releaseOutputBuffer(ox,False)
+            elif ox==MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                of=codec.getOutputFormat()
+                rate=int(of.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+                channels=int(of.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+                try: encoding=int(of.getInteger(MediaFormat.KEY_PCM_ENCODING))
+                except Exception: encoding=2
+        raw=b"".join(chunks)
+        if not raw: raise ValueError("Декодер повернув порожній файл")
+        samples=array("h")
+        if encoding==4:
+            n=len(raw)//4
+            for x in struct.unpack("<"+"f"*n,raw[:n*4]):
+                samples.append(int(max(-1.0,min(1.0,x))*32767))
+        else:
+            raw=raw[:len(raw)//2*2]; samples.frombytes(raw)
+        if channels>1:
+            mono=array("h")
+            for i in range(0,len(samples)-channels+1,channels):
+                mono.append(int(sum(samples[i:i+channels])/channels))
+            samples=mono
+        if rate!=RATE and samples:
+            ratio=rate/float(RATE); count=max(1,int(len(samples)/ratio)); out=array("h")
+            for i in range(count):
+                p=i*ratio; a=min(int(p),len(samples)-1); b=min(a+1,len(samples)-1)
+                out.append(int(samples[a]+(samples[b]-samples[a])*(p-a)))
+            samples=out
+        return samples
+    finally:
+        try:
+            if codec: codec.stop(); codec.release()
+        except Exception: pass
+        try: extractor.release()
+        except Exception: pass
+
+class Mixer:
+    def __init__(self):
+        self.lock=threading.RLock(); self.cache={}; self.voices=[]
+    def play(self,path,gain=1.0):
+        def worker():
+            try:
+                data=self.cache.get(path)
+                if data is None:
+                    data=decode_audio(path)
+                    with self.lock: self.cache[path]=data
+                if data:
+                    with self.lock: self.voices.append([data,0,float(gain)])
+            except Exception as e: log("SoundPad decode: "+str(e))
+        threading.Thread(target=worker,daemon=True).start()
+    def stop(self):
+        with self.lock: self.voices=[]
+    def mix(self,raw):
+        n=len(raw)//2*2
+        if not n: return raw
+        out=array("h"); out.frombytes(raw[:n])
+        with self.lock:
+            alive=[]
+            for data,pos,gain in self.voices:
+                count=min(len(out),len(data)-pos)
+                for i in range(max(0,count)):
+                    out[i]=max(-32768,min(32767,int(out[i]+data[pos+i]*gain)))
+                pos+=max(0,count)
+                if pos<len(data): alive.append([data,pos,gain])
+            self.voices=alive
+        return out.tobytes()+raw[n:]
+mixer=Mixer()
+
+class RecordFrameHook(MethodHook):
+    def before_hooked_method(self,p):
+        try:
+            buf=p.args[0]; length=min(int(p.args[1]),int(buf.capacity()))
+            if length<=0:return
+            pos=int(buf.position()); limit=int(buf.limit())
+            buf.position(0); buf.limit(length); raw=bytearray(length); buf.get(raw,0,length)
+            mixed=mixer.mix(bytes(raw))
+            if mixed!=bytes(raw):
+                buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
+            buf.limit(limit); buf.position(pos)
+        except Exception as e: log("SoundPad writeFrame: "+str(e))
+
+class VoipAudioHook(MethodHook):
+    field=None
+    def before_hooked_method(self,p):
+        try:
+            size=int(p.args[0])
+            if size<=0:return
+            if VoipAudioHook.field is None:
+                f=p.thisObject.getClass().getDeclaredField("byteBuffer"); f.setAccessible(True)
+                VoipAudioHook.field=f
+            buf=VoipAudioHook.field.get(p.thisObject)
+            n=min(size,int(buf.capacity())); buf.position(0); buf.limit(n)
+            raw=bytearray(n); buf.get(raw,0,n); mixed=mixer.mix(bytes(raw))
+            if mixed!=bytes(raw): buf.position(0); buf.put(mixed,0,min(n,len(mixed)))
+            buf.position(0); buf.limit(int(buf.capacity()))
+        except Exception as e: log("SoundPad WebRTC: "+str(e))
+
+class DragListener(View.OnTouchListener):
+    def __init__(self,panel):
+        self.panel=panel; self.x=0; self.y=0; self.sx=0; self.sy=0
+    def onTouch(self,v,event):
+        c=self.panel.container
+        if c is None:return False
+        a=event.getAction()
+        if a==MotionEvent.ACTION_DOWN:
+            self.x=float(event.getRawX()); self.y=float(event.getRawY())
+            self.sx=float(c.getTranslationX()); self.sy=float(c.getTranslationY()); return True
+        if a==MotionEvent.ACTION_MOVE:
+            c.setTranslationX(self.sx+float(event.getRawX())-self.x)
+            c.setTranslationY(self.sy+float(event.getRawY())-self.y); return True
+        return True
+
+class Panel:
+    def __init__(self,plugin):
+        self.plugin=plugin; self.root=None; self.container=None; self.visible=False; self.page=0
+    def build(self,ctx):
+        from android.graphics.drawable import GradientDrawable
+        card=LinearLayout(ctx); card.setOrientation(1); card.setPadding(9,8,9,8)
+        bg=GradientDrawable(); bg.setColor(Color.rgb(29,32,41)); bg.setCornerRadius(18.0)
+        card.setBackground(bg); card.setElevation(8.0)
+        head=TextView(ctx); head.setText("🔊 SoundPad  ·  %d/4"%(self.page+1))
+        head.setTextColor(Color.WHITE); head.setTextSize(14); head.setPadding(8,5,8,8)
+        head.setOnTouchListener(DragListener(self)); card.addView(head)
+        for rowno in range(2):
+            row=LinearLayout(ctx); row.setOrientation(0)
+            for col in range(4):
+                i=self.page*8+rowno*4+col
+                name=self.plugin.get_setting("slot_%d_label"%i,"Звук %d"%(i+1))
+                file=self.plugin.get_setting("slot_%d_file"%i,"")
+                enabled=self.plugin.get_setting("slot_%d_enabled"%i,True)
+                b=TextView(ctx); b.setText(str(name) if file and enabled else "＋ %d"%(i+1))
+                b.setTextColor(Color.WHITE); b.setTextSize(12); b.setGravity(Gravity.CENTER)
+                b.setMaxLines(2); b.setPadding(3,5,3,5)
+                shape=GradientDrawable(); shape.setColor(Color.rgb(48,108,196) if file and enabled else Color.rgb(75,78,87))
+                shape.setCornerRadius(11.0); b.setBackground(shape)
+                if file and enabled:
+                    path=os.path.join(sounds_dir(),file)
+                    gain=float(self.plugin.get_setting("slot_%d_gain"%i,100))/100.0
+                    b.setOnClickListener(OnClickListener(lambda v,n=i:self.plugin.play_slot(n)))
+                lp=LinearLayout.LayoutParams(0,50,1.0); lp.setMargins(3,3,3,3); row.addView(b,lp)
+            card.addView(row)
+        controls=LinearLayout(ctx); controls.setOrientation(0)
+        for title,fn,col in [("‹",lambda:self.change(-1),Color.rgb(65,70,82)),
+                             ("⏹ СТОП",self.plugin.stop_all,Color.rgb(190,55,55)),
+                             ("›",lambda:self.change(1),Color.rgb(65,70,82))]:
+            b=TextView(ctx); b.setText(title); b.setTextColor(Color.WHITE); b.setGravity(Gravity.CENTER)
+            shape=GradientDrawable(); shape.setColor(col); shape.setCornerRadius(10.0); b.setBackground(shape)
+            b.setPadding(8,9,8,9); b.setOnClickListener(OnClickListener(lambda v,f=fn:f()))
+            lp=LinearLayout.LayoutParams(0,-2,1.0); lp.setMargins(3,7,3,0); controls.addView(b,lp)
+        card.addView(controls); return card
+    def change(self,d):
+        self.page=(self.page+d)%4; self.refresh()
+    def refresh(self):
+        if self.visible and self.container is not None:
+            self.container.removeAllViews(); self.container.addView(self.build(self.plugin.get_activity()))
+    def show(self):
+        if self.visible:self.refresh(); return
+        act=self.plugin.get_activity()
+        if act is None: log("SoundPad: Activity not ready"); return
+        try:
+            from android import R as AR
+            self.root=act.getWindow().getDecorView().findViewById(AR.id.content)
+            self.container=FrameLayout(act); self.container.addView(self.build(act))
+            lp=FrameLayout.LayoutParams(-2,-2); lp.gravity=Gravity.TOP|Gravity.END
+            lp.topMargin=70; lp.rightMargin=8; self.root.addView(self.container,lp); self.visible=True
+        except Exception as e: log("SoundPad panel: "+str(e))
+    def hide(self):
+        try:
+            if self.visible and self.root is not None:self.root.removeView(self.container)
+        except Exception: pass
+        self.root=None; self.container=None; self.visible=False
+
+class RecordStartHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def after_hooked_method(self,param): self.p.show_panel()
+class RecordStopHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def before_hooked_method(self,param): mixer.stop(); self.p.hide_panel()
+class VoipStateHook(MethodHook):
+    def __init__(self,p,est,ends): self.p=p; self.est=est; self.ends=ends
+    def after_hooked_method(self,param):
+        try:
+            state=int(param.args[0])
+            if state==self.est:self.p.show_panel()
+            elif state in self.ends:mixer.stop(); self.p.hide_panel()
+        except Exception as e: log("SoundPad call state: "+str(e))
+class ResumeHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def after_hooked_method(self,param): self.p.activity=param.thisObject
+class ImportHook(MethodHook):
+    def __init__(self,p): self.p=p
+    def before_hooked_method(self,param):
+        try:
+            if int(param.args[0])!=IMPORT_CODE:return
+            data=param.args[2]
+            if data is None or data.getData() is None:return
+            resolver=self.p.get_context().getContentResolver(); uri=data.getData()
+            stream=resolver.openInputStream(uri); name="sound_%d.audio"%int(time.time())
+            try:
+                cur=resolver.query(uri,None,None,None,None)
+                if cur is not None:
+                    try:
+                        if cur.moveToFirst():
+                            from android.provider import OpenableColumns
+                            ix=cur.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if ix>=0:name=str(cur.getString(ix))
+                    finally:cur.close()
+            except Exception:pass
+            safe="".join(c if c.isalnum() or c in "._-" else "_" for c in name) or "sound.audio"
+            dest=os.path.join(sounds_dir(),safe); base,ext=os.path.splitext(dest); n=1
+            while os.path.exists(dest):dest="%s_%d%s"%(base,n,ext); n+=1
+            with open(dest,"wb") as out:
+                while True:
+                    chunk=stream.read(65536)
+                    if not chunk:break
+                    out.write(chunk)
+            stream.close(); self.p.refresh_settings()
+            self.p.notify("Імпортовано: "+os.path.basename(dest))
+        except Exception as e: log("SoundPad import: "+str(e))
 
 class SoundPadPlugin(BasePlugin):
     def on_plugin_load(self):
-        self._players = []
-        self.logger.info("SoundPad loaded")
-
+        self.activity=None; self.panel=Panel(self); self.unhooks=[]
+        if self.get_setting("enabled",True):self.install_hooks()
+        log("SoundPad loaded")
+    def get_context(self):
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            return ApplicationLoader.applicationContext
+        except Exception:return None
+    def get_activity(self):return self.activity
+    def notify(self,msg):
+        try:
+            from ui.bulletin import BulletinHelper
+            run_on_ui_thread(lambda:BulletinHelper.show_info(msg))
+        except Exception:log(msg)
+    def hook(self,cls,name,types,handler):
+        try:
+            m=cls.getDeclaredMethod(name,*types); m.setAccessible(True)
+            u=self.hook_method(m,handler)
+            if u:self.unhooks.append(u); log("SoundPad hook: "+name); return True
+        except Exception as e:log("SoundPad hook unavailable "+name+": "+str(e))
+        return False
+    def install_hooks(self):
+        from java.lang import Integer, String, Long
+        from java.nio import ByteBuffer
+        try:
+            c=find_class("org.telegram.messenger.MediaController")
+            if c:
+                self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
+                self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
+                self.hook(c,"stopRecord",[],RecordStopHook(self))
+        except Exception as e:log("SoundPad recording hooks: "+str(e))
+        try:
+            c=find_class("org.telegram.ui.LaunchActivity")
+            if c:
+                from android.content import Intent
+                self.hook(c,"onResume",[],ResumeHook(self))
+                self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
+        except Exception as e:log("SoundPad import hooks: "+str(e))
+        try:
+            c=find_class("org.telegram.messenger.voip.VoIPService")
+            if c:
+                def read(name,default):
+                    try:
+                        f=c.getDeclaredField(name); f.setAccessible(True); return int(f.getInt(None))
+                    except Exception:return default
+                est=read("STATE_ESTABLISHED",3)
+                ends={read("STATE_ENDED",11),read("STATE_FAILED",4),read("STATE_BUSY",17),read("STATE_HANGING_UP",10)}
+                self.hook(c,"dispatchStateChanged",[Integer.TYPE],VoipStateHook(self,est,ends))
+        except Exception as e:log("SoundPad VoIP state: "+str(e))
+        for name in ["org.webrtc.voiceengine.WebRtcAudioRecord","org.webrtc.audio.WebRtcAudioRecord","org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord"]:
+            try:
+                c=find_class(name)
+                if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):break
+            except Exception:pass
+    def play_slot(self,i):
+        name=self.get_setting("slot_%d_file"%i,"")
+        path=os.path.join(sounds_dir(),name) if name else ""
+        if not path or not os.path.isfile(path):self.notify("Спочатку вибери аудіофайл"); return
+        gain=float(self.get_setting("slot_%d_gain"%i,100))/100.0
+        mixer.play(path,gain)
+    def stop_all(self):mixer.stop()
+    def show_panel(self):
+        if self.get_setting("enabled",True):run_on_ui_thread(self.panel.show)
+    def hide_panel(self):run_on_ui_thread(self.panel.hide)
+    def open_picker(self,view):
+        try:
+            if self.activity is None:self.notify("Відкрий Telegram і повтори імпорт"); return
+            from android.content import Intent
+            it=Intent(Intent.ACTION_OPEN_DOCUMENT); it.addCategory(Intent.CATEGORY_OPENABLE); it.setType("audio/*")
+            self.activity.startActivityForResult(it,IMPORT_CODE)
+        except Exception as e:self.notify("Помилка вибору файлу: "+str(e))
+    def refresh_settings(self):
+        try:self.set_setting("_refresh",str(time.time()),reload_settings=True)
+        except Exception:pass
+    def create_settings(self)->List[Any]:
+        files=sorted(f for f in os.listdir(sounds_dir()) if os.path.isfile(os.path.join(sounds_dir(),f)))
+        choices=["— не вибрано —"]+files
+        rows=[Header(text="SoundPad · 32 звуки"),
+              Switch(key="enabled",text="Увімкнути плагін",default=True),
+              Text(text="Плаваюча панель: 4×2 кнопки, 4 сторінки. Працює під час запису голосових і дзвінків, якщо відповідні хуки доступні."),
+              Text(text="＋ ІМПОРТУВАТИ АУДІО",icon="msg_addbot",on_click=self.open_picker),
+              Text(text="⏹ ЗУПИНИТИ ВСІ ЗВУКИ",icon="msg_cancel",red=True,on_click=lambda v:self.stop_all()),Divider()]
+        for i in range(SLOTS):
+            current=self.get_setting("slot_%d_file"%i,"")
+            idx=files.index(current)+1 if current in files else 0
+            rows += [Header(text="Кнопка %d"%(i+1)),
+                     Input(key="slot_%d_label"%i,text="Назва",default="Звук %d"%(i+1)),
+                     Selector(key="slot_%d_select"%i,text="Файл",default=idx,items=choices,
+                         on_change=lambda v,n=i,fs=files:self.set_setting("slot_%d_file"%n,fs[v-1] if v>0 and v<=len(fs) else "")),
+                     Switch(key="slot_%d_enabled"%i,text="Показувати кнопку",default=True),
+                     Input(key="slot_%d_gain"%i,text="Гучність (%)",default="100"),Divider()]
+        return rows
     def on_plugin_unload(self):
-        self._stop_all()
-
-    def _play(self, index):
-        path = str(self.get_setting("path_%02d" % index, "") or "").strip()
-        if not path:
-            self.logger.warning("Slot %d: choose an audio file path first", index)
-            return
-        try:
-            audio_file = File(path)
-            if not audio_file.exists() or not audio_file.isFile():
-                self.logger.warning("Audio file not found: %s", path)
-                return
-            player = MediaPlayer()
-            player.setDataSource(path)
-            player.setOnCompletionListener(lambda mp: self._release(mp))
-            player.setOnErrorListener(lambda mp, what, extra: self._on_error(mp, what, extra))
-            player.prepare()
-            self._players.append(player)
-            player.start()
-        except Exception as error:
-            self.logger.error("Playback error in slot %d: %s", index, str(error))
-
-    def _release(self, player):
-        try:
-            player.release()
-        except Exception:
-            pass
-        try:
-            self._players.remove(player)
-        except Exception:
-            pass
-
-    def _on_error(self, player, what, extra):
-        self.logger.error("MediaPlayer error: %s / %s", str(what), str(extra))
-        self._release(player)
-        return True
-
-    def _stop_all(self, view=None):
-        players = list(self._players)
-        self._players = []
-        for player in players:
-            try:
-                player.stop()
-            except Exception:
-                pass
-            try:
-                player.release()
-            except Exception:
-                pass
-        self.logger.info("Stopped all SoundPad sounds")
-
-    def create_settings(self) -> List[Any]:
-        items = [
-            Header(text="SoundPad — 32 звуки"),
-            Text(text="Для кожного слота задай назву та повний шлях до аудіофайлу. Кілька файлів можна відтворювати одночасно.", subtext="Приклад: /storage/emulated/0/Music/sound.mp3"),
-            Text(text="ВАЖЛИВО: зараз звук відтворюється локально. Підмішування в мікрофон, плаваюча панель і автоматичне показування під час запису/дзвінка ще не реалізовані.", red=True),
-            Text(text="⏹ ЗУПИНИТИ ВСІ ЗВУКИ", icon="msg_cancel", red=True, on_click=self._stop_all),
-            Divider()
-        ]
-        for index in range(1, SLOT_COUNT + 1):
-            slot = "%02d" % index
-            items.extend([
-                Header(text="Кнопка %d" % index),
-                Input(key="name_" + slot, text="Назва звуку", default="Звук %d" % index),
-                Input(key="path_" + slot, text="Шлях до аудіофайлу", default="", subtext="MP3 / WAV / OGG / M4A — залежить від Android"),
-                Text(text="▶ ВІДТВОРИТИ", icon="msg_play", on_click=lambda view, i=index: self._play(i)),
-                Divider()
-            ])
-        return items
+        mixer.stop(); self.panel.hide()
+        for u in self.unhooks:
+            try:self.unhook_method(u)
+            except Exception:pass
+        self.unhooks=[]
