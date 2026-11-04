@@ -14,7 +14,7 @@ from android.widget import FrameLayout, LinearLayout, TextView
 __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
-__author__ = "kostapechonkin-jpg"
+__author__ = "@Mango_mango_mango_mango & ChatGPT"
 __version__ = "0.3.4"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
