@@ -8,9 +8,9 @@
     {
       "id": "soundpad",
       "name": "SoundPad",
-      "description": "32 configurable sound slots with simultaneous local playback",
+      "description": "32-slot floating soundboard for voice messages and calls (development build)",
       "author": "kostapechonkin-jpg",
-      "version": "0.2.0",
+      "version": "0.2.0-dev",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -19,8 +19,8 @@
         "tools"
       ],
       "file": "plugins/soundpad/soundpad.plugin",
-      "sha256": "2051fb48d6ea1f7db0c8a750362933c4820f1c54eadd653c556157446e935be7",
-      "size": 3837
+      "sha256": "02e753f34beab5a15dcfb9a4ee46243d7e3d25953dcc6723aa0ac6032f45ab14",
+      "size": 19747
     }
   ]
 }
