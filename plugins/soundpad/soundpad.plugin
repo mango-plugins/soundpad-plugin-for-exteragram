@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.3.8_audiofix"
+__version__ = "0.3.9_pcmfix"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -270,13 +270,18 @@ class AudioRecordReadHook(MethodHook):
             if length<=0:return
             old_pos=int(buf.position()); old_limit=int(buf.limit())
             buf.position(0); buf.limit(length)
-            raw=bytearray(length); buf.get(raw,0,length)
-            source=bytes(raw); mixed=mixer.mix(source,stream)
+            from java import jarray, jbyte
+            java_in=jarray(jbyte)(length)
+            buf.get(java_in,0,length)
+            source=bytes((int(v)&255 for v in java_in))
+            mixed=mixer.mix(source,stream)
             if mixed!=source:
-                buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
+                java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
+                buf.position(0)
+                buf.put(java_out,0,min(length,len(java_out)))
             if rate not in AudioRecordReadHook._logged_rates:
                 AudioRecordReadHook._logged_rates.add(rate)
-                log("SoundPad: AudioRecord.read hook active; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
+                log("SoundPad: AudioRecord.read active; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
         except Exception as e:
             log("SoundPad AudioRecord.read hook error: "+str(e))
         finally:
@@ -336,7 +341,7 @@ class Panel:
                 enabled=self.plugin.get_setting("slot_%d_enabled"%i,True)
                 btn=TextView(ctx); btn.setText(str(name) if file and enabled else "＋ %d"%(i+1))
                 btn.setTextColor(Color.rgb(245,250,255)); btn.setTextSize(12); btn.setGravity(Gravity.CENTER)
-                btn.setMaxLines(2); btn.setPadding(3,4,3,4)
+                btn.setSingleLine(True); btn.setMaxLines(1); btn.setHorizontallyScrolling(True); btn.setPadding(3,4,3,4)
                 try:
                     from android.text import TextUtils
                     btn.setEllipsize(TextUtils.TruncateAt.END)
