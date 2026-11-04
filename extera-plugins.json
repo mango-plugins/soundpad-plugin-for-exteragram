@@ -10,7 +10,7 @@
       "name": "SoundPad",
       "description": "32-slot neon soundboard with direct digital audio injection",
       "author": "@Mango_mango_mango_mango & ChatGPT",
-      "version": "0.3.9_pcmfix",
+      "version": "0.4.0_audio_routes",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -19,8 +19,8 @@
         "tools"
       ],
       "file": "plugins/soundpad/soundpad.plugin",
-      "sha256": "887d7ca2f006f43cb55ee4902748e5f9882c56fd53a8fabea19961c235b02334",
-      "size": 36164
+      "sha256": "e2e8d0ee87970f2b6df1f43ec77b2ae458ce5742e5a4ac21ec4a3bc2fc8b406c",
+      "size": 37846
     }
   ]
 }
