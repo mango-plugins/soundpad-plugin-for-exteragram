@@ -1,4 +1,4 @@
-import os, struct, threading, time
+import os, struct, threading, time, shutil
 from array import array
 from typing import Any, List
 from base_plugin import BasePlugin, MethodHook
@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -27,6 +27,38 @@ def sounds_dir():
     path=os.path.join(get_plugins_dir(),"soundpad_sounds")
     ensure_dir_exists(path)
     return path
+
+def external_sounds_dir():
+    # Public shared-storage folder visible in Android's Downloads app.
+    path="/storage/emulated/0/Download/exterasounds"
+    if not os.path.isdir(path):
+        os.makedirs(path,exist_ok=True)
+    return path
+
+def sync_external_sounds():
+    """Copy supported audio files from Downloads/exterasounds into plugin storage."""
+    src=external_sounds_dir()
+    dst=sounds_dir()
+    copied=0
+    supported=(".mp3",".wav",".ogg",".m4a",".aac",".flac",".3gp",".opus")
+    try:
+        for name in sorted(os.listdir(src)):
+            source=os.path.join(src,name)
+            if not os.path.isfile(source) or not name.lower().endswith(supported):
+                continue
+            target=os.path.join(dst,name)
+            if os.path.exists(target) and os.path.getmtime(target)>=os.path.getmtime(source) and os.path.getsize(target)==os.path.getsize(source):
+                continue
+            base,ext=os.path.splitext(name)
+            candidate=target; n=1
+            while os.path.exists(candidate) and candidate!=target:
+                candidate=os.path.join(dst,"%s_%d%s"%(base,n,ext)); n+=1
+            shutil.copyfile(source,candidate)
+            copied+=1
+        return copied
+    except Exception as e:
+        log("SoundPad Downloads scan: "+str(e))
+        return -1
 
 def decode_audio(path, target_rate=RATE):
     from android.media import MediaExtractor, MediaCodec, MediaFormat
@@ -307,6 +339,8 @@ class ImportHook(MethodHook):
 class SoundPadPlugin(BasePlugin):
     def on_plugin_load(self):
         self.activity=None; self.panel=Panel(self); self.unhooks=[]
+        try: external_sounds_dir()
+        except Exception as e: log("SoundPad folder create: "+str(e))
         if self.get_setting("enabled",True):self.install_hooks()
         log("SoundPad loaded")
     def get_context(self):
@@ -415,12 +449,15 @@ class SoundPadPlugin(BasePlugin):
         try:self.set_setting("_refresh",str(time.time()),reload_settings=True)
         except Exception:pass
     def create_settings(self)->List[Any]:
+        sync_external_sounds()
         files=sorted(f for f in os.listdir(sounds_dir()) if os.path.isfile(os.path.join(sounds_dir(),f)))
         choices=["— не вибрано —"]+files
         rows=[Header(text="SoundPad · 32 звуки"),
               Switch(key="enabled",text="Увімкнути плагін",default=True),
-              Text(text="Плаваюча панель: 4×2 кнопки, 4 сторінки. Працює під час запису голосових і дзвінків, якщо відповідні хуки доступні."),
-              Text(text="＋ ІМПОРТУВАТИ АУДІО",icon="msg_addbot",on_click=self.open_picker),
+              Text(text="Звуки автоматично беруться з Download/exterasounds. Підтримка: MP3, WAV, OGG, M4A, AAC, FLAC, 3GP, OPUS."),
+              Text(text="Папка: /storage/emulated/0/Download/exterasounds"),
+              Text(text="＋ ОНОВИТИ СПИСОК ЗВУКІВ",icon="msg_retry",on_click=lambda v:self.refresh_settings()),
+              Text(text="＋ ІМПОРТУВАТИ АУДІО (старий спосіб)",icon="msg_addbot",on_click=self.open_picker),
               Divider()]
         for i in range(SLOTS):
             current=self.get_setting("slot_%d_file"%i,"")
