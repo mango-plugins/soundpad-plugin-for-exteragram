@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.9"
+__version__ = "0.3.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -269,28 +269,15 @@ class Panel:
         lp.x=int(self.plugin.get_setting("panel_x",12)); lp.y=int(self.plugin.get_setting("panel_y",140))
         self.wm.addView(self.container,lp); self.visible=True; self.overlay=True
     def show(self):
-        mode=int(self.plugin.get_setting("display_mode",0) or 0)
         if self.visible:
-            if self.overlay==(mode==1):self.refresh(); return
+            if self.overlay:self.refresh(); return
             self.hide()
-        if mode==1:
-            if not self.allowed():
-                self.plugin.notify("Потрібен дозвіл «Показ поверх інших програм» для ExteraGram.")
-                self.plugin.open_overlay_permission(); return
-            try:self.show_overlay()
-            except Exception as e:
-                log("SoundPad overlay: "+str(e)); self.plugin.notify("Помилка плаваючої панелі: "+str(e))
-            return
-        act=self.plugin.get_activity()
-        if act is None:return
-        try:
-            from android import R as AR
-            self.root=act.getWindow().getDecorView().findViewById(AR.id.content)
-            self.make_container(act)
-            lp=FrameLayout.LayoutParams(-2,-2); lp.gravity=Gravity.TOP|Gravity.RIGHT
-            lp.topMargin=70; lp.rightMargin=8; self.root.addView(self.container,lp)
-            self.visible=True; self.overlay=False
-        except Exception as e:log("SoundPad panel: "+str(e))
+        if not self.allowed():
+            self.plugin.notify("Потрібен дозвіл «Показ поверх інших програм» для ExteraGram.")
+            self.plugin.open_overlay_permission(); return
+        try:self.show_overlay()
+        except Exception as e:
+            log("SoundPad overlay: "+str(e)); self.plugin.notify("Помилка плаваючої панелі: "+str(e))
     def refresh(self):
         if not self.visible or self.container is None:return
         try:
@@ -344,10 +331,11 @@ class ResumeHook(MethodHook):
     def after_hooked_method(self,param):
         self.p.activity=param.thisObject
         self.p.show_panel()
-class PauseHook(MethodHook):
+class DestroyHook(MethodHook):
     def __init__(self,p): self.p=p
     def before_hooked_method(self,param):
-        if int(self.p.get_setting("display_mode",0) or 0)==0:self.p.hide_panel()
+        self.p.hide_panel()
+        self.p.activity=None
 class ImportHook(MethodHook):
     def __init__(self,p): self.p=p
     def before_hooked_method(self,param):
@@ -451,7 +439,7 @@ class SoundPadPlugin(BasePlugin):
             if c:
                 from android.content import Intent
                 self.hook(c,"onResume",[],ResumeHook(self))
-                self.hook(c,"onPause",[],PauseHook(self))
+                self.hook(c,"onDestroy",[],DestroyHook(self))
                 self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
         except Exception as e:log("SoundPad import hooks: "+str(e))
         try:
@@ -491,15 +479,6 @@ class SoundPadPlugin(BasePlugin):
             ctx.startActivity(intent)
         except Exception as e:
             log("SoundPad overlay permission: "+str(e)); self.notify("Не вдалося відкрити налаштування дозволу: "+str(e))
-    def change_display_mode(self,value):
-        try:
-            mode=int(value); self.set_setting("display_mode",mode)
-            run_on_ui_thread(self.panel.hide)
-            if mode==1 and not self.panel.allowed():
-                self.notify("Надай ExteraGram дозвіл «Показ поверх інших програм».")
-                self.open_overlay_permission()
-            else:self.show_panel()
-        except Exception as e:log("SoundPad display mode: "+str(e))
     def open_picker(self,view):
         try:
             # Resolve the live Activity from the settings row itself. The plugin
@@ -538,9 +517,7 @@ class SoundPadPlugin(BasePlugin):
         rows=[Header(text="SoundPad · 32 звуки"),
               Switch(key="enabled",text="Увімкнути плагін",default=True),
               Header(text="Плаваюча панель"),
-              Selector(key="display_mode",text="Режим показу",default=int(self.get_setting("display_mode",0) or 0),
-                       items=["Тільки в Telegram","Поверх усіх програм"],on_change=self.change_display_mode),
-              Text(text="Для показу поверх інших програм потрібен дозвіл Android.",
+              Text(text="Панель завжди показується поверх усіх програм. Для роботи потрібен дозвіл Android.",
                    icon="msg_settings",on_click=self.open_overlay_permission),
               Text(text="Кнопка «−» згортає панель у 🔊. Натисни 🔊, щоб розгорнути."),
               Text(text="Звуки автоматично беруться з Download/exterasounds. Підтримка: MP3, WAV, OGG, M4A, AAC, FLAC, 3GP, OPUS."),
