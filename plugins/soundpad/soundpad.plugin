@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -241,7 +241,7 @@ class Panel:
                 lp=LinearLayout.LayoutParams(0,50,1.0); lp.setMargins(3,3,3,3); row.addView(btn,lp)
             card.addView(row)
         controls=LinearLayout(ctx); controls.setOrientation(0)
-        for label,fn,col in [("‹",lambda:self.change(-1),Color.rgb(65,70,82)),("⏹ СТОП",self.plugin.stop_all,Color.rgb(190,55,55)),("›",lambda:self.change(1),Color.rgb(65,70,82))]:
+        for label,fn,col in [("‹",lambda:self.change(-1),Color.rgb(65,70,82)),("⏹ СТОП",self.plugin.stop_all,Color.rgb(190,55,55)),("›",lambda:self.change(1),Color.rgb(65,70,82)),("✕",self.hide,Color.rgb(150,45,45))]:
             btn=self.button(ctx,label,fn,col); lp=LinearLayout.LayoutParams(0,-2,1.0)
             lp.setMargins(3,7,3,0); controls.addView(btn,lp)
         card.addView(controls); return card
@@ -331,11 +331,6 @@ class ResumeHook(MethodHook):
     def after_hooked_method(self,param):
         self.p.activity=param.thisObject
         self.p.show_panel()
-class DestroyHook(MethodHook):
-    def __init__(self,p): self.p=p
-    def before_hooked_method(self,param):
-        self.p.hide_panel()
-        self.p.activity=None
 class ImportHook(MethodHook):
     def __init__(self,p): self.p=p
     def before_hooked_method(self,param):
@@ -439,7 +434,6 @@ class SoundPadPlugin(BasePlugin):
             if c:
                 from android.content import Intent
                 self.hook(c,"onResume",[],ResumeHook(self))
-                self.hook(c,"onDestroy",[],DestroyHook(self))
                 self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
         except Exception as e:log("SoundPad import hooks: "+str(e))
         try:
