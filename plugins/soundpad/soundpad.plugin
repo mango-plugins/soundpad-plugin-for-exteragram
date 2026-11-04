@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.3.6"
+__version__ = "0.3.7"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -130,22 +130,29 @@ def decode_audio(path, target_rate=RATE):
         except Exception: pass
 
 class Mixer:
+    # Telegram voice-note recording is 16 kHz mono PCM; WebRTC capture is
+    # normally 48 kHz PCM. Keep independent playback cursors so one hook
+    # cannot consume the sound before the other audio path receives it.
     def __init__(self):
-        self.lock=threading.RLock(); self.cache={}; self.voices=[]; self.target_rate=RATE
+        self.lock=threading.RLock()
+        self.cache={}
+        self.voices={"record":[],"voip":[]}
     def play(self,path,gain=1.0):
         def worker():
             try:
-                with self.lock: target_rate=self.target_rate
-                key=(path,target_rate); data=self.cache.get(key)
-                if data is None:
-                    data=decode_audio(path,target_rate)
-                    with self.lock: self.cache[key]=data
-                if data:
-                    # Digital injection only: the samples are mixed into ExteraGram's
-                    # outgoing microphone/recording buffers by RecordFrameHook/VoipAudioHook.
-                    # Never play them through the phone speaker; that would be re-captured
-                    # acoustically by the microphone and sound like a second phone.
-                    with self.lock: self.voices.append([data,0,float(gain)])
+                prepared={}
+                for stream,rate in (("record",16000),("voip",48000)):
+                    key=(path,rate)
+                    data=self.cache.get(key)
+                    if data is None:
+                        data=decode_audio(path,rate)
+                        with self.lock: self.cache[key]=data
+                    if data: prepared[stream]=data
+                if prepared:
+                    with self.lock:
+                        for stream,data in prepared.items():
+                            self.voices[stream].append([data,0,float(gain)])
+                    log("SoundPad: audio decoded; record=%d voip=%d samples"%(len(prepared.get("record",[])),len(prepared.get("voip",[]))))
                 else:
                     log("SoundPad: decoded audio is empty: "+str(path))
             except Exception as e:
@@ -153,20 +160,21 @@ class Mixer:
         threading.Thread(target=worker,daemon=True).start()
     def stop(self):
         with self.lock:
-            self.voices=[]
-    def mix(self,raw):
+            self.voices={"record":[],"voip":[]}
+    def mix(self,raw,stream):
         n=len(raw)//2*2
-        if not n: return raw
+        if not n:return raw
         out=array("h"); out.frombytes(raw[:n])
         with self.lock:
             alive=[]
-            for data,pos,gain in self.voices:
+            voices=self.voices.get(stream,[])
+            for data,pos,gain in voices:
                 count=min(len(out),len(data)-pos)
                 for i in range(max(0,count)):
                     out[i]=max(-32768,min(32767,int(out[i]+data[pos+i]*gain)))
                 pos+=max(0,count)
-                if pos<len(data): alive.append([data,pos,gain])
-            self.voices=alive
+                if pos<len(data):alive.append([data,pos,gain])
+            self.voices[stream]=alive
         return out.tobytes()+raw[n:]
 mixer=Mixer()
 
@@ -185,7 +193,7 @@ class RecordFrameHook(MethodHook):
             old_pos=int(buf.position()); old_limit=int(buf.limit())
             buf.position(0); buf.limit(length)
             raw=bytearray(length); buf.get(raw,0,length)
-            source=bytes(raw); mixed=mixer.mix(source)
+            source=bytes(raw); mixed=mixer.mix(source,"record")
             if mixed!=source:
                 buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
             if not RecordFrameHook._logged_first:
@@ -227,7 +235,7 @@ class VoipAudioHook(MethodHook):
             old_pos=int(buf.position()); old_limit=int(buf.limit())
             buf.position(0); buf.limit(length)
             raw=bytearray(length); buf.get(raw,0,length)
-            source=bytes(raw); mixed=mixer.mix(source)
+            source=bytes(raw); mixed=mixer.mix(source,"voip")
             if mixed!=source:
                 buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
             if not VoipAudioHook._logged_first:
