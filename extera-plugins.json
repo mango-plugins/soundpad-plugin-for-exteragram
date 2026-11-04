@@ -8,9 +8,9 @@
     {
       "id": "soundpad",
       "name": "SoundPad",
-      "description": "32-slot neon floating soundboard for voice messages and calls",
+      "description": "32-slot neon soundboard with direct digital audio injection",
       "author": "@Mango_mango_mango_mango & ChatGPT",
-      "version": "0.3.4",
+      "version": "0.3.5",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -19,8 +19,8 @@
         "tools"
       ],
       "file": "plugins/soundpad/soundpad.plugin",
-      "sha256": "f46ae9b5a9be480a77774bbaee3cefbd54164054703afba90ec33055aaa7cbf5",
-      "size": 33672
+      "sha256": "0254387e6997ecb4cf9116c6c6bb36ec4a804f562da5b2792e4d1658776f0eb3",
+      "size": 31980
     }
   ]
 }
