@@ -1,0 +1,95 @@
+from typing import Any, List
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Divider, Input, Text
+from android.media import MediaPlayer
+from java.io import File
+
+__id__ = "soundpad"
+__name__ = "SoundPad"
+__description__ = "32 sound slots with simultaneous local playback."
+__author__ = "kostapechonkin-jpg"
+__version__ = "0.2.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=13.1.1"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["media", "tools"]
+
+SLOT_COUNT = 32
+
+
+class SoundPadPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._players = []
+        self.logger.info("SoundPad loaded")
+
+    def on_plugin_unload(self):
+        self._stop_all()
+
+    def _play(self, index):
+        path = str(self.get_setting("path_%02d" % index, "") or "").strip()
+        if not path:
+            self.logger.warning("Slot %d: choose an audio file path first", index)
+            return
+        try:
+            audio_file = File(path)
+            if not audio_file.exists() or not audio_file.isFile():
+                self.logger.warning("Audio file not found: %s", path)
+                return
+            player = MediaPlayer()
+            player.setDataSource(path)
+            player.setOnCompletionListener(lambda mp: self._release(mp))
+            player.setOnErrorListener(lambda mp, what, extra: self._on_error(mp, what, extra))
+            player.prepare()
+            self._players.append(player)
+            player.start()
+        except Exception as error:
+            self.logger.error("Playback error in slot %d: %s", index, str(error))
+
+    def _release(self, player):
+        try:
+            player.release()
+        except Exception:
+            pass
+        try:
+            self._players.remove(player)
+        except Exception:
+            pass
+
+    def _on_error(self, player, what, extra):
+        self.logger.error("MediaPlayer error: %s / %s", str(what), str(extra))
+        self._release(player)
+        return True
+
+    def _stop_all(self, view=None):
+        players = list(self._players)
+        self._players = []
+        for player in players:
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                player.release()
+            except Exception:
+                pass
+        self.logger.info("Stopped all SoundPad sounds")
+
+    def create_settings(self) -> List[Any]:
+        items = [
+            Header(text="SoundPad — 32 звуки"),
+            Text(text="Для кожного слота задай назву та повний шлях до аудіофайлу. Кілька файлів можна відтворювати одночасно.", subtext="Приклад: /storage/emulated/0/Music/sound.mp3"),
+            Text(text="ВАЖЛИВО: зараз звук відтворюється локально. Підмішування в мікрофон, плаваюча панель і автоматичне показування під час запису/дзвінка ще не реалізовані.", red=True),
+            Text(text="⏹ ЗУПИНИТИ ВСІ ЗВУКИ", icon="msg_cancel", red=True, on_click=self._stop_all),
+            Divider()
+        ]
+        for index in range(1, SLOT_COUNT + 1):
+            slot = "%02d" % index
+            items.extend([
+                Header(text="Кнопка %d" % index),
+                Input(key="name_" + slot, text="Назва звуку", default="Звук %d" % index),
+                Input(key="path_" + slot, text="Шлях до аудіофайлу", default="", subtext="MP3 / WAV / OGG / M4A — залежить від Android"),
+                Text(text="▶ ВІДТВОРИТИ", icon="msg_play", on_click=lambda view, i=index: self._play(i)),
+                Divider()
+            ])
+        return items
