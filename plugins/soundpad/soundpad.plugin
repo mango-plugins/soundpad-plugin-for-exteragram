@@ -1,7 +1,7 @@
 import os, struct, threading, time, shutil
 from array import array
 from typing import Any, List
-from base_plugin import BasePlugin, MethodHook
+from base_plugin import BasePlugin, AppEvent, MethodHook
 from android_utils import OnClickListener, run_on_ui_thread, log
 from file_utils import ensure_dir_exists, get_plugins_dir
 from hook_utils import find_class
@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -171,33 +171,76 @@ class Mixer:
 mixer=Mixer()
 
 class RecordFrameHook(MethodHook):
+    _logged_first=False
     def before_hooked_method(self,p):
+        buf=None
+        old_pos=0
+        old_limit=0
         try:
-            buf=p.args[0]; length=min(int(p.args[1]),int(buf.capacity()))
+            buf=p.args[0]
+            requested=int(p.args[1])
+            capacity=int(buf.capacity())
+            length=min(requested,capacity)
             if length<=0:return
-            pos=int(buf.position()); limit=int(buf.limit())
-            buf.position(0); buf.limit(length); raw=bytearray(length); buf.get(raw,0,length)
-            mixed=mixer.mix(bytes(raw))
-            if mixed!=bytes(raw):
+            old_pos=int(buf.position()); old_limit=int(buf.limit())
+            buf.position(0); buf.limit(length)
+            raw=bytearray(length); buf.get(raw,0,length)
+            source=bytes(raw); mixed=mixer.mix(source)
+            if mixed!=source:
                 buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
-            buf.limit(limit); buf.position(pos)
-        except Exception as e: log("SoundPad writeFrame: "+str(e))
+            if not RecordFrameHook._logged_first:
+                RecordFrameHook._logged_first=True
+                log("SoundPad: MediaController.writeFrame працює; bytes=%d active=%d changed=%s"%(length,len(mixer.voices),str(mixed!=source)))
+        except Exception as e:
+            log("SoundPad writeFrame hook error: "+str(e))
+        finally:
+            if buf is not None:
+                try:
+                    buf.limit(old_limit); buf.position(old_pos)
+                except Exception: pass
 
 class VoipAudioHook(MethodHook):
-    field=None
+    _logged_first=False
     def before_hooked_method(self,p):
+        buf=None
+        old_pos=0
+        old_limit=0
         try:
             size=int(p.args[0])
             if size<=0:return
-            if VoipAudioHook.field is None:
-                f=p.thisObject.getClass().getDeclaredField("byteBuffer"); f.setAccessible(True)
-                VoipAudioHook.field=f
-            buf=VoipAudioHook.field.get(p.thisObject)
-            n=min(size,int(buf.capacity())); buf.position(0); buf.limit(n)
-            raw=bytearray(n); buf.get(raw,0,n); mixed=mixer.mix(bytes(raw))
-            if mixed!=bytes(raw): buf.position(0); buf.put(mixed,0,min(n,len(mixed)))
-            buf.position(0); buf.limit(int(buf.capacity()))
-        except Exception as e: log("SoundPad WebRTC: "+str(e))
+            instance=p.thisObject
+            cls=instance.getClass()
+            field=None
+            while cls is not None and field is None:
+                try:
+                    field=cls.getDeclaredField("byteBuffer")
+                    field.setAccessible(True)
+                except Exception:
+                    try: cls=cls.getSuperclass()
+                    except Exception: cls=None
+            if field is None:
+                raise RuntimeError("byteBuffer field not found in WebRTC recorder")
+            buf=field.get(instance)
+            if buf is None:return
+            length=min(size,int(buf.capacity()))
+            if length<=0:return
+            old_pos=int(buf.position()); old_limit=int(buf.limit())
+            buf.position(0); buf.limit(length)
+            raw=bytearray(length); buf.get(raw,0,length)
+            source=bytes(raw); mixed=mixer.mix(source)
+            if mixed!=source:
+                buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
+            if not VoipAudioHook._logged_first:
+                VoipAudioHook._logged_first=True
+                log("SoundPad: WebRTC microphone hook works; bytes=%d active=%d changed=%s"%(length,len(mixer.voices),str(mixed!=source)))
+        except Exception as e:
+            log("SoundPad WebRTC hook error: "+str(e))
+        finally:
+            if buf is not None:
+                try:
+                    buf.limit(old_limit if old_limit>0 else int(buf.capacity()))
+                    buf.position(old_pos)
+                except Exception: pass
 
 class DragListener(dynamic_proxy(View.OnTouchListener)):
     def __init__(self,panel):
@@ -438,7 +481,20 @@ class SoundPadPlugin(BasePlugin):
         try: external_sounds_dir()
         except Exception as e: log("SoundPad folder create: "+str(e))
         if self.get_setting("enabled",True):self.install_hooks()
-        log("SoundPad loaded")
+        # Do not depend only on LaunchActivity.onResume: plugin loading can happen
+        # after that callback. In overlay mode the application context is enough.
+        self.show_panel()
+        log("SoundPad loaded; startup panel requested")
+    def on_app_event(self,event_type):
+        try:
+            if event_type in (AppEvent.START,AppEvent.RESUME):
+                self.closed_until_resume=False
+                self.show_panel()
+            elif event_type in (AppEvent.STOP,AppEvent.PAUSE):
+                if int(self.get_setting("display_mode",0) or 0)==0:
+                    self.hide_panel()
+        except Exception as e:
+            log("SoundPad app lifecycle: "+str(e))
     def get_context(self):
         try:
             from org.telegram.messenger import ApplicationLoader
