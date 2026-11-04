@@ -10,7 +10,7 @@
       "name": "SoundPad",
       "description": "32-slot floating soundboard for voice messages and calls (development build)",
       "author": "kostapechonkin-jpg",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -19,8 +19,8 @@
         "tools"
       ],
       "file": "plugins/soundpad/soundpad.plugin",
-      "sha256": "a6f66e82178b77eec819bc4b1835a0bcdca1dc4d2d0c0bd1665cd6512df04b06",
-      "size": 29742
+      "sha256": "73e97835ec61c376bce57367e5b5fbd9cb4b4c6b169f515846909323235e4b16",
+      "size": 32318
     }
   ]
 }
