@@ -8,6 +8,7 @@ from hook_utils import find_class
 from ui.settings import Header, Divider, Input, Selector, Switch, Text
 from android.graphics import Color
 from android.view import Gravity, View, MotionEvent
+from java import dynamic_proxy
 from android.widget import FrameLayout, LinearLayout, TextView
 
 __id__ = "soundpad"
@@ -157,8 +158,9 @@ class VoipAudioHook(MethodHook):
             buf.position(0); buf.limit(int(buf.capacity()))
         except Exception as e: log("SoundPad WebRTC: "+str(e))
 
-class DragListener(View.OnTouchListener):
+class DragListener(dynamic_proxy(View.OnTouchListener)):
     def __init__(self,panel):
+        super().__init__()
         self.panel=panel; self.x=0; self.y=0; self.sx=0; self.sy=0
     def onTouch(self,v,event):
         c=self.panel.container
