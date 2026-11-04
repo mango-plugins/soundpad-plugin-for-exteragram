@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.3.7_bugfix"
+__version__ = "0.3.8_audiofix"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -136,12 +136,13 @@ class Mixer:
     def __init__(self):
         self.lock=threading.RLock()
         self.cache={}
-        self.voices={"record":[],"voip":[]}
+        self.voices={str(rate):[] for rate in (16000,32000,44100,48000)}
     def play(self,path,gain=1.0):
         def worker():
             try:
                 prepared={}
-                for stream,rate in (("record",16000),("voip",48000)):
+                for rate in (16000,32000,44100,48000):
+                    stream=str(rate)
                     key=(path,rate)
                     data=self.cache.get(key)
                     if data is None:
@@ -152,7 +153,7 @@ class Mixer:
                     with self.lock:
                         for stream,data in prepared.items():
                             self.voices[stream].append([data,0,float(gain)])
-                    log("SoundPad: audio decoded; record=%d voip=%d samples"%(len(prepared.get("record",[])),len(prepared.get("voip",[]))))
+                    log("SoundPad: audio decoded for rates: "+",".join(sorted(prepared.keys())))
                 else:
                     log("SoundPad: decoded audio is empty: "+str(path))
             except Exception as e:
@@ -160,7 +161,7 @@ class Mixer:
         threading.Thread(target=worker,daemon=True).start()
     def stop(self):
         with self.lock:
-            self.voices={"record":[],"voip":[]}
+            self.voices={str(rate):[] for rate in (16000,32000,44100,48000)}
     def mix(self,raw,stream):
         n=len(raw)//2*2
         if not n:return raw
@@ -243,6 +244,41 @@ class VoipAudioHook(MethodHook):
                 log("SoundPad: WebRTC microphone hook works; bytes=%d active=%d changed=%s"%(length,len(mixer.voices),str(mixed!=source)))
         except Exception as e:
             log("SoundPad WebRTC hook error: "+str(e))
+        finally:
+            if buf is not None:
+                try:
+                    buf.limit(old_limit if old_limit>0 else int(buf.capacity()))
+                    buf.position(old_pos)
+                except Exception: pass
+
+
+class AudioRecordReadHook(MethodHook):
+    _logged_rates=set()
+    def after_hooked_method(self,p):
+        buf=None
+        old_pos=0
+        old_limit=0
+        try:
+            read_count=int(p.getResult())
+            if read_count<=0:return
+            buf=p.args[0]
+            if buf is None:return
+            rate=int(p.thisObject.getSampleRate())
+            stream=str(min((16000,32000,44100,48000),key=lambda x:abs(x-rate)))
+            length=min(read_count,int(buf.capacity()))
+            length-=length%2
+            if length<=0:return
+            old_pos=int(buf.position()); old_limit=int(buf.limit())
+            buf.position(0); buf.limit(length)
+            raw=bytearray(length); buf.get(raw,0,length)
+            source=bytes(raw); mixed=mixer.mix(source,stream)
+            if mixed!=source:
+                buf.position(0); buf.put(mixed,0,min(length,len(mixed)))
+            if rate not in AudioRecordReadHook._logged_rates:
+                AudioRecordReadHook._logged_rates.add(rate)
+                log("SoundPad: AudioRecord.read hook active; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
+        except Exception as e:
+            log("SoundPad AudioRecord.read hook error: "+str(e))
         finally:
             if buf is not None:
                 try:
@@ -540,10 +576,13 @@ class SoundPadPlugin(BasePlugin):
         try:
             c=find_class("org.telegram.messenger.MediaController")
             if c:
-                self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
                 self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
                 self.hook(c,"stopRecord",[],RecordStopHook(self))
-        except Exception as e:log("SoundPad recording hooks: "+str(e))
+        except Exception as e:log("SoundPad recording lifecycle hooks: "+str(e))
+        try:
+            from android.media import AudioRecord
+            self.hook(AudioRecord,"read",[ByteBuffer,Integer.TYPE],AudioRecordReadHook())
+        except Exception as e:log("SoundPad AudioRecord hook install error: "+str(e))
         try:
             c=find_class("org.telegram.ui.LaunchActivity")
             if c:
@@ -568,11 +607,7 @@ class SoundPadPlugin(BasePlugin):
                 ends={read("STATE_ENDED",11),read("STATE_FAILED",4),read("STATE_BUSY",17),read("STATE_HANGING_UP",10)}
                 self.hook(c,"dispatchStateChanged",[Integer.TYPE],VoipStateHook(self,est,ends))
         except Exception as e:log("SoundPad VoIP state: "+str(e))
-        for name in ["org.webrtc.voiceengine.WebRtcAudioRecord","org.webrtc.audio.WebRtcAudioRecord","org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord"]:
-            try:
-                c=find_class(name)
-                if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):break
-            except Exception:pass
+
     def play_slot(self,i):
         if self.closed_until_resume:return
         name=self.get_setting("slot_%d_file"%i,"")
