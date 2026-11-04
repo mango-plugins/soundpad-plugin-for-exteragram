@@ -15,7 +15,7 @@ __id__ = "soundpad"
 __name__ = "SoundPad"
 __description__ = "32-slot floating soundboard for voice messages and calls"
 __author__ = "kostapechonkin-jpg"
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -258,9 +258,17 @@ class ImportHook(MethodHook):
     def __init__(self,p): self.p=p
     def before_hooked_method(self,param):
         try:
-            if int(param.args[0])!=IMPORT_CODE:return
+            request_code=int(param.args[0])
+            result_code=int(param.args[1])
+            log("SoundPad: onActivityResult request=%d result=%d"%(request_code,result_code))
+            if request_code!=IMPORT_CODE:return
+            if result_code!=-1:
+                log("SoundPad: file picker cancelled or returned non-OK result")
+                return
             data=param.args[2]
-            if data is None or data.getData() is None:return
+            if data is None or data.getData() is None:
+                self.p.notify("Файловий менеджер не повернув вибраний файл")
+                return
             resolver=self.p.get_context().getContentResolver(); uri=data.getData()
             stream=resolver.openInputStream(uri); name="sound_%d.audio"%int(time.time())
             try:
@@ -276,18 +284,25 @@ class ImportHook(MethodHook):
             safe="".join(c if c.isalnum() or c in "._-" else "_" for c in name) or "sound.audio"
             dest=os.path.join(sounds_dir(),safe); base,ext=os.path.splitext(dest); n=1
             while os.path.exists(dest):dest="%s_%d%s"%(base,n,ext); n+=1
-            with open(dest,"wb") as out:
-                while True:
-                    chunk=stream.read(65536)
-                    if not chunk:break
-                    out.write(chunk)
-            stream.close()
+            from java import jarray, jbyte
+            buffer=jarray(jbyte)(65536)
+            try:
+                with open(dest,"wb") as out:
+                    while True:
+                        count=int(stream.read(buffer))
+                        if count<0: break
+                        if count==0: continue
+                        out.write(bytes(buffer[:count]))
+            finally:
+                stream.close()
             log("SoundPad: imported file %s (%d bytes) into %s" % (safe, os.path.getsize(dest), sounds_dir()))
             # Rebuild settings on the UI thread so Selector.items is regenerated
             # from the newly imported directory contents.
             run_on_ui_thread(self.p.refresh_settings)
             self.p.notify("Імпортовано: "+os.path.basename(dest))
-        except Exception as e: log("SoundPad import: "+str(e))
+        except Exception as e:
+            log("SoundPad import error: "+str(e))
+            self.p.notify("Не вдалося імпортувати файл: "+str(e))
 
 class SoundPadPlugin(BasePlugin):
     def on_plugin_load(self):
@@ -307,12 +322,19 @@ class SoundPadPlugin(BasePlugin):
         except Exception:log(msg)
     def hook(self,cls,name,types,handler):
         try:
-            try:
-                # Public inherited Android callbacks (notably Activity.onActivityResult)
-                # may not be declared directly on LaunchActivity.
-                m=cls.getMethod(name,*types)
-            except Exception:
-                m=cls.getDeclaredMethod(name,*types)
+            # getMethod only finds public methods. Android Activity callbacks
+            # are often protected, and may be declared by a superclass.
+            current=cls
+            m=None
+            while current is not None:
+                try:
+                    m=current.getDeclaredMethod(name,*types)
+                    break
+                except Exception:
+                    try: current=current.getSuperclass()
+                    except Exception: current=None
+            if m is None:
+                raise Exception("Method not found in class hierarchy: "+name)
             m.setAccessible(True)
             u=self.hook_method(m,handler)
             if u:self.unhooks.append(u); log("SoundPad hook: "+name); return True
