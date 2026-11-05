@@ -7,10 +7,10 @@
   "plugins": [
     {
       "id": "soundpad_reloaded",
-      "name": "SoundPad Reloaded",
+      "name": "Mango SoundPad",
       "description": "32-slot soundboard for voice messages, video notes and calls",
       "author": "@Mango_mango_mango_mango & ChatGPT",
-      "version": "0.4.4",
+      "version": "0.4.5",
       "icon": "exteraPlugins/1",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -18,9 +18,9 @@
         "media",
         "tools"
       ],
-      "file": "plugins/soundpad/soundpad_reloaded.plugin",
-      "sha256": "f8f73a2b0fa1e9a4c6b4c934855b23a50af38831be0be7bedb072ebcc97e5d78",
-      "size": 37910
+      "file": "mango_soundpad.plugin",
+      "sha256": "c8d39f13aa7a44fc1bd20d3bdc366a354b52831e601e6e35e69cde74c32b45bb",
+      "size": 37926
     }
   ]
 }
