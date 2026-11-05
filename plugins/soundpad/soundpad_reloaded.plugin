@@ -616,6 +616,7 @@ class SoundPadPlugin(BasePlugin):
                         log("SoundPad: WebRTC audio hook installed: "+name)
                         break
                 except Exception as e:log("SoundPad WebRTC candidate "+name+": "+str(e))
+        except Exception as e:log("SoundPad WebRTC hooks: "+str(e))
         try:
             c=find_class("org.telegram.ui.LaunchActivity")
             if c:
