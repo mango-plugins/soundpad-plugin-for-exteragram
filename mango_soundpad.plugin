@@ -15,7 +15,7 @@ __id__ = "soundpad_reloaded"
 __name__ = "Mango SoundPad"
 __description__ = "32-slot soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -137,6 +137,9 @@ class Mixer:
         self.lock=threading.RLock()
         self.cache={}
         self.target_rate=16000
+        self.mode="idle"
+        self.record_hook_active=False
+        self.webrtc_hook_active=False
         self.voices={str(rate):[] for rate in (8000,16000,32000,44100,48000)}
     def play(self,path,gain=1.0):
         def worker():
@@ -262,6 +265,9 @@ class AudioRecordReadHook(MethodHook):
         try:
             read_count=int(p.getResult())
             if read_count<=0:return
+            if mixer.mode=="idle":return
+            if mixer.mode=="record" and mixer.record_hook_active:return
+            if mixer.mode=="call" and mixer.webrtc_hook_active:return
             buf=p.args[0]
             if buf is None:return
             rate=int(p.thisObject.getSampleRate())
@@ -450,19 +456,20 @@ class Panel:
 class RecordStartHook(MethodHook):
     def __init__(self,p): self.p=p
     def after_hooked_method(self,param):
+        mixer.mode="record"
         try: mixer.target_rate=int(param.args[1])
         except Exception: mixer.target_rate=RATE
         self.p.show_panel()
 class RecordStopHook(MethodHook):
     def __init__(self,p): self.p=p
-    def before_hooked_method(self,param): mixer.stop(); self.p.hide_panel()
+    def before_hooked_method(self,param): mixer.mode="idle"; mixer.stop(); self.p.hide_panel()
 class VoipStateHook(MethodHook):
     def __init__(self,p,est,ends): self.p=p; self.est=est; self.ends=ends
     def after_hooked_method(self,param):
         try:
             state=int(param.args[0])
-            if state==self.est: mixer.target_rate=RATE; self.p.show_panel()
-            elif state in self.ends:mixer.stop(); self.p.hide_panel()
+            if state==self.est: mixer.mode="call"; mixer.target_rate=RATE; self.p.show_panel()
+            elif state in self.ends:mixer.mode="idle"; mixer.stop(); self.p.hide_panel()
         except Exception as e: log("SoundPad call state: "+str(e))
 class ResumeHook(MethodHook):
     def __init__(self,p): self.p=p
@@ -534,7 +541,7 @@ class SoundPadPlugin(BasePlugin):
         # Do not depend only on LaunchActivity.onResume: plugin loading can happen
         # after that callback. In overlay mode the application context is enough.
         self.show_panel()
-        log("SoundPad loaded; startup panel requested")
+        log("Mango SoundPad 0.4.6 loaded; startup panel requested")
     def on_app_event(self,event_type):
         try:
             if event_type in (AppEvent.START,AppEvent.RESUME):
@@ -603,7 +610,7 @@ class SoundPadPlugin(BasePlugin):
         try:
             c=find_class("org.telegram.messenger.MediaController")
             if c:
-                self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
+                mixer.record_hook_active=self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
                 self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
                 self.hook(c,"stopRecord",[],RecordStopHook(self))
                 log("SoundPad: MediaController recording hooks installed")
@@ -613,10 +620,16 @@ class SoundPadPlugin(BasePlugin):
                 try:
                     c=find_class(name)
                     if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):
+                        mixer.webrtc_hook_active=True
                         log("SoundPad: WebRTC audio hook installed: "+name)
                         break
                 except Exception as e:log("SoundPad WebRTC candidate "+name+": "+str(e))
         except Exception as e:log("SoundPad WebRTC hooks: "+str(e))
+        try:
+            c=find_class("android.media.AudioRecord")
+            if c and self.hook(c,"read",[ByteBuffer,Integer.TYPE],AudioRecordReadHook()):
+                log("SoundPad: AudioRecord.read fallback hook installed")
+        except Exception as e:log("SoundPad AudioRecord fallback: "+str(e))
         try:
             c=find_class("org.telegram.ui.LaunchActivity")
             if c:
