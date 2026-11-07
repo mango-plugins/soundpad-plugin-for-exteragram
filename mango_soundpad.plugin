@@ -32,14 +32,14 @@ def log(message):
 
 def get_diagnostic_log():
     with _LOG_LOCK:
-        return "\\n".join(_LOG_LINES[-_LOG_LIMIT:]) or "Журнал поки порожній."
+        return "\n".join(_LOG_LINES[-_LOG_LIMIT:]) or "Журнал поки порожній."
 
 
 __id__ = "soundpad_reloaded"
 __name__ = "Mango SoundPad"
 __description__ = "32-slot soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -283,44 +283,41 @@ class VoipAudioHook(MethodHook):
 class AudioRecordReadHook(MethodHook):
     _logged_rates=set()
     def after_hooked_method(self,p):
-        buf=None
-        old_pos=0
-        old_limit=0
         try:
             read_count=int(p.getResult())
-            if read_count<=0:return
-            if mixer.mode=="idle":return
-            if mixer.mode=="record" and mixer.record_hook_active:return
-            if mixer.mode=="call" and mixer.webrtc_hook_active:return
-            buf=p.args[0]
-            if buf is None:return
+            if read_count<=0 or mixer.mode=="idle": return
+            if mixer.record_hook_active or mixer.webrtc_hook_active: return
+            args=p.args
+            target=args[0] if len(args)>0 else None
+            if target is None:return
             rate=int(p.thisObject.getSampleRate())
             stream=str(min((8000,16000,32000,44100,48000),key=lambda x:abs(x-rate)))
-            length=min(read_count,int(buf.capacity()))
-            length-=length%2
-            if length<=0:return
-            old_pos=int(buf.position()); old_limit=int(buf.limit())
-            buf.position(0); buf.limit(length)
             from java import jarray, jbyte
-            java_in=jarray(jbyte)(length)
-            buf.get(java_in,0,length)
-            source=bytes((int(v)&255 for v in java_in))
-            mixed=mixer.mix(source,stream)
-            if mixed!=source:
-                java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
-                buf.position(0)
-                buf.put(java_out,0,min(length,len(java_out)))
+            if hasattr(target,"position") and hasattr(target,"capacity"):
+                end=int(target.position()); length=min(read_count,end); length-=length%2
+                if length<=0:return
+                start=end-length; dup=target.duplicate()
+                dup.position(start); dup.limit(start+length)
+                java_in=jarray(jbyte)(length); dup.get(java_in,0,length)
+                source=bytes((int(v)&255 for v in java_in))
+                mixed=mixer.mix(source,stream)
+                if mixed!=source:
+                    java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
+                    dup.position(start); dup.put(java_out,0,min(length,len(java_out)))
+            else:
+                offset=int(args[1]) if len(args)>1 else 0
+                length=min(read_count,len(target)-offset); length-=length%2
+                if length<=0:return
+                source=bytes((int(target[offset+i])&255 for i in range(length)))
+                mixed=mixer.mix(source,stream)
+                if mixed!=source:
+                    java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
+                    for i in range(length): target[offset+i]=java_out[i]
             if rate not in AudioRecordReadHook._logged_rates:
                 AudioRecordReadHook._logged_rates.add(rate)
-                log("SoundPad: AudioRecord.read active; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
+                log("SoundPad: AudioRecord.read реально змінює PCM; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
         except Exception as e:
             log("SoundPad AudioRecord.read hook error: "+str(e))
-        finally:
-            if buf is not None:
-                try:
-                    buf.limit(old_limit if old_limit>0 else int(buf.capacity()))
-                    buf.position(old_pos)
-                except Exception: pass
 
 class DragListener(dynamic_proxy(View.OnTouchListener)):
     def __init__(self,panel):
@@ -565,7 +562,7 @@ class SoundPadPlugin(BasePlugin):
         # Do not depend only on LaunchActivity.onResume: plugin loading can happen
         # after that callback. In overlay mode the application context is enough.
         self.show_panel()
-        log("Mango SoundPad 0.4.7 loaded; startup panel requested")
+        log("Mango SoundPad 0.4.8 loaded; startup panel requested")
     def on_app_event(self,event_type):
         try:
             if event_type in (AppEvent.START,AppEvent.RESUME):
@@ -628,6 +625,44 @@ class SoundPadPlugin(BasePlugin):
             if u:self.unhooks.append(u); log("SoundPad hook: "+name); return True
         except Exception as e:log("SoundPad hook unavailable "+name+": "+str(e))
         return False
+    def hook_audio_record_overloads(self,cls):
+        installed=0
+        current=cls
+        seen=set()
+        try:
+            while current is not None:
+                try: methods=current.getDeclaredMethods()
+                except Exception: methods=[]
+                for method in methods:
+                    try:
+                        if str(method.getName())!="read": continue
+                        params=method.getParameterTypes()
+                        if len(params)<2 or str(params[0].getName()) not in ("java.nio.ByteBuffer","[B"): continue
+                        signature=str(method.toString())
+                        if signature in seen: continue
+                        seen.add(signature); method.setAccessible(True)
+                        unhook=self.hook_method(method,AudioRecordReadHook())
+                        if unhook:
+                            self.unhooks.append(unhook); installed+=1
+                            log("SoundPad AudioRecord overload hooked: "+signature)
+                    except Exception as e: log("SoundPad AudioRecord overload skipped: "+str(e))
+                try: current=current.getSuperclass()
+                except Exception: current=None
+        except Exception as e: log("SoundPad AudioRecord reflection scan: "+str(e))
+        return installed
+
+    def dump_audio_methods(self,cls,label):
+        try:
+            found=[]; current=cls
+            while current is not None:
+                for method in current.getDeclaredMethods():
+                    name=str(method.getName()).lower()
+                    if any(k in name for k in ("record","audio","write","capture","voice","frame")):
+                        found.append(str(method.toString()))
+                current=current.getSuperclass()
+            log("SoundPad method scan "+label+": "+" || ".join(found[:80]))
+        except Exception as e: log("SoundPad method scan "+label+" error: "+str(e))
+
     def install_hooks(self):
         from java.lang import Integer, String, Long
         from java.nio import ByteBuffer
@@ -637,7 +672,8 @@ class SoundPadPlugin(BasePlugin):
                 mixer.record_hook_active=self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
                 self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
                 self.hook(c,"stopRecord",[],RecordStopHook(self))
-                log("SoundPad: MediaController recording hooks installed")
+                self.dump_audio_methods(c,"MediaController")
+                log("SoundPad: MediaController hook status writeFrame=%s"%(str(mixer.record_hook_active)))
         except Exception as e:log("SoundPad recording hooks: "+str(e))
         try:
             for name in ["org.webrtc.voiceengine.WebRtcAudioRecord","org.webrtc.audio.WebRtcAudioRecord","org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord"]:
@@ -651,8 +687,10 @@ class SoundPadPlugin(BasePlugin):
         except Exception as e:log("SoundPad WebRTC hooks: "+str(e))
         try:
             c=find_class("android.media.AudioRecord")
-            if c and self.hook(c,"read",[ByteBuffer,Integer.TYPE],AudioRecordReadHook()):
-                log("SoundPad: AudioRecord.read fallback hook installed")
+            if c:
+                count=self.hook_audio_record_overloads(c)
+                log("SoundPad: AudioRecord read overloads installed=%d"%count)
+                if count==0:self.dump_audio_methods(c,"AudioRecord")
         except Exception as e:log("SoundPad AudioRecord fallback: "+str(e))
         try:
             c=find_class("org.telegram.ui.LaunchActivity")
@@ -685,8 +723,12 @@ class SoundPadPlugin(BasePlugin):
         path=os.path.join(sounds_dir(),name) if name else ""
         if not path or not os.path.isfile(path):self.notify("Спочатку вибери аудіофайл"); return
         gain=float(self.get_setting("slot_%d_gain"%i,100))/100.0
+        mixer.mode="record"
+        log("SoundPad: sound button tapped slot=%d file=%s mode=%s"%(i+1,name,mixer.mode))
         mixer.play(path,gain)
-    def stop_all(self):mixer.stop()
+    def stop_all(self):
+        log("SoundPad: stop button tapped")
+        mixer.stop()
     def show_panel(self):
         if self.get_setting("enabled",True) and not self.closed_until_resume:run_on_ui_thread(self.panel.show)
     def hide_panel(self):run_on_ui_thread(self.panel.hide)
