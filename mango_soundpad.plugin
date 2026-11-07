@@ -2,7 +2,7 @@ import os, struct, threading, time, shutil
 from array import array
 from typing import Any, List
 from base_plugin import BasePlugin, AppEvent, MethodHook
-from android_utils import OnClickListener, run_on_ui_thread, log
+from android_utils import OnClickListener, run_on_ui_thread, log as _host_log
 from file_utils import ensure_dir_exists, get_plugins_dir
 from hook_utils import find_class
 from ui.settings import Header, Divider, Input, Selector, Switch, Text
@@ -11,11 +11,35 @@ from android.view import Gravity, View, MotionEvent
 from java import dynamic_proxy
 from android.widget import FrameLayout, LinearLayout, TextView
 
+# Keep a small in-memory diagnostic log so users can report audio-hook failures.
+_LOG_LOCK=threading.RLock()
+_LOG_LINES=[]
+_LOG_LIMIT=300
+
+def log(message):
+    try:
+        line=str(message)
+        with _LOG_LOCK:
+            _LOG_LINES.append("%s | %s"%(time.strftime("%H:%M:%S"),line))
+            if len(_LOG_LINES)>_LOG_LIMIT:
+                del _LOG_LINES[:-_LOG_LIMIT]
+    except Exception:
+        pass
+    try:
+        _host_log(str(message))
+    except Exception:
+        pass
+
+def get_diagnostic_log():
+    with _LOG_LOCK:
+        return "\\n".join(_LOG_LINES[-_LOG_LIMIT:]) or "Журнал поки порожній."
+
+
 __id__ = "soundpad_reloaded"
 __name__ = "Mango SoundPad"
 __description__ = "32-slot soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -541,7 +565,7 @@ class SoundPadPlugin(BasePlugin):
         # Do not depend only on LaunchActivity.onResume: plugin loading can happen
         # after that callback. In overlay mode the application context is enough.
         self.show_panel()
-        log("Mango SoundPad 0.4.6 loaded; startup panel requested")
+        log("Mango SoundPad 0.4.7 loaded; startup panel requested")
     def on_app_event(self,event_type):
         try:
             if event_type in (AppEvent.START,AppEvent.RESUME):
@@ -717,11 +741,40 @@ class SoundPadPlugin(BasePlugin):
     def refresh_settings(self):
         try:self.set_setting("_refresh",str(time.time()),reload_settings=True)
         except Exception:pass
+    def show_logs(self,view=None):
+        try:
+            from android.app import AlertDialog
+            ctx=view.getContext() if view is not None else self.get_activity()
+            if ctx is None: ctx=self.get_context()
+            if ctx is None:
+                self.notify("Не вдалося відкрити журнал. Перезапусти ExteraGram і спробуй ще раз.")
+                return
+            message=get_diagnostic_log()
+            dialog=AlertDialog.Builder(ctx).setTitle("📋 Журнал Mango SoundPad").setMessage(message).setPositiveButton("Копіювати",None).setNegativeButton("Закрити",None).create()
+            dialog.show()
+            try:
+                from android.content import ClipData
+                button=dialog.getButton(-1)
+                def copy_log():
+                    try:
+                        clipboard=ctx.getSystemService(ctx.CLIPBOARD_SERVICE)
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Mango SoundPad log",get_diagnostic_log()))
+                        self.notify("Журнал скопійовано. Надішли його сюди.")
+                    except Exception as e:
+                        log("SoundPad log copy error: "+str(e))
+                        self.notify("Не вдалося скопіювати журнал: "+str(e))
+                button.setOnClickListener(OnClickListener(lambda v:copy_log()))
+            except Exception as e: log("SoundPad log dialog button: "+str(e))
+        except Exception as e:
+            log("SoundPad show log error: "+str(e))
+            self.notify("Помилка відкриття журналу: "+str(e))
+
     def create_settings(self)->List[Any]:
         sync_external_sounds()
         files=sorted(f for f in os.listdir(sounds_dir()) if os.path.isfile(os.path.join(sounds_dir(),f)))
         choices=["— не вибрано —"]+files
-        rows=[Header(text="SoundPad · 32 звуки"),
+        rows=[Header(text="Mango SoundPad · 32 звуки"),
+              Text(text="📋 ВІДКРИТИ ЖУРНАЛ І СКОПІЮВАТИ",icon="msg_info",on_click=self.show_logs),
               Switch(key="enabled",text="Увімкнути плагін",default=True),
               Header(text="Плаваюча панель"),
               Selector(key="display_mode",text="Режим показу",default=int(self.get_setting("display_mode",0) or 0),
