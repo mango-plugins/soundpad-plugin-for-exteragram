@@ -10,7 +10,7 @@
       "name": "Mango SoundPad",
       "description": "32-slot soundboard for voice messages, video notes and calls",
       "author": "@Mango_mango_mango_mango & ChatGPT",
-      "version": "0.4.9",
+      "version": "0.5.0",
       "icon": "https://raw.githubusercontent.com/mango-plugins/soundpad-plugin-for-exteragram/main/mango_soundpad_avatar.svg",
       "app_version": ">=13.1.1",
       "sdk_version": ">=1.4.4.3",
@@ -19,8 +19,8 @@
         "tools"
       ],
       "file": "mango_soundpad.plugin",
-      "sha256": "f080fc91096b7bc54e765b91169c2ad0586550999bb87e6fff6614a2b991ec5a",
-      "size": 44369
+      "sha256": "c2845be0faa6d753883afaa322f25765d347df5490b4e2f4179a1f6647c142c1",
+      "size": 45204
     }
   ]
 }
