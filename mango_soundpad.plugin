@@ -39,7 +39,7 @@ __id__ = "soundpad_reloaded"
 __name__ = "Mango SoundPad"
 __description__ = "32-slot soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
 __category__ = ["media", "tools"]
@@ -162,6 +162,8 @@ class Mixer:
         self.target_rate=16000
         self.mode="idle"
         self.record_hook_active=False
+        self.record_frame_seen=False
+        self.audio_read_seen=set()
         self.webrtc_hook_active=False
         self.voices={str(rate):[] for rate in (8000,16000,32000,44100,48000)}
     def play(self,path,gain=1.0):
@@ -213,6 +215,7 @@ class RecordFrameHook(MethodHook):
         old_pos=0
         old_limit=0
         try:
+            mixer.record_frame_seen=True
             buf=p.args[0]
             requested=int(p.args[1])
             capacity=int(buf.capacity())
@@ -285,7 +288,9 @@ class AudioRecordReadHook(MethodHook):
         try:
             read_count=int(p.getResult())
             if read_count<=0 or mixer.mode=="idle": return
-            if mixer.record_hook_active or mixer.webrtc_hook_active: return
+            # A hook being INSTALLED does not mean Telegram actually calls it.
+            # Use AudioRecord.read until the MediaController frame hook is observed.
+            if mixer.record_frame_seen or mixer.webrtc_hook_active: return
             args=p.args
             target=args[0] if len(args)>0 else None
             if target is None:return
@@ -325,7 +330,7 @@ class AudioRecordReadHook(MethodHook):
                         for i in range(length): target[offset+i]=java_out[i]
             if rate not in AudioRecordReadHook._logged_rates:
                 AudioRecordReadHook._logged_rates.add(rate)
-                log("SoundPad: AudioRecord.read реально змінює PCM; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
+                log("SoundPad: AudioRecord.read runtime; rate=%d bytes=%d mode=%s active=%d changed=%s"%(rate,length,mixer.mode,len(mixer.voices.get(stream,[])),str(mixed!=source)))
         except Exception as e:
             log("SoundPad AudioRecord.read hook error: "+str(e))
 
@@ -488,6 +493,8 @@ class RecordStartHook(MethodHook):
     def __init__(self,p): self.p=p
     def after_hooked_method(self,param):
         mixer.mode="record"
+        mixer.record_frame_seen=False
+        AudioRecordReadHook._logged_rates.clear()
         try: mixer.target_rate=int(param.args[1])
         except Exception: mixer.target_rate=RATE
         self.p.show_panel()
@@ -572,7 +579,7 @@ class SoundPadPlugin(BasePlugin):
         # Do not depend only on LaunchActivity.onResume: plugin loading can happen
         # after that callback. In overlay mode the application context is enough.
         self.show_panel()
-        log("Mango SoundPad 0.5.0 loaded; startup panel requested")
+        log("Mango SoundPad 0.5.1 loaded; startup panel requested")
     def on_app_event(self,event_type):
         try:
             if event_type in (AppEvent.START,AppEvent.RESUME):
@@ -753,6 +760,8 @@ class SoundPadPlugin(BasePlugin):
         if not path or not os.path.isfile(path):self.notify("Спочатку вибери аудіофайл"); return
         gain=float(self.get_setting("slot_%d_gain"%i,100))/100.0
         mixer.mode="record"
+        mixer.record_frame_seen=False
+        AudioRecordReadHook._logged_rates.clear()
         log("Mango SoundPad: button tapped slot=%d file=%s mode=%s"%(i+1,name,mixer.mode))
         mixer.play(path,gain)
     def stop_all(self):
