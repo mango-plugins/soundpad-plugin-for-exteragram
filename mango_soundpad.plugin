@@ -39,7 +39,7 @@ __id__ = "soundpad_reloaded"
 __name__ = "Mango SoundPad"
 __description__ = "32-slot soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.4.9"
+__version__ = "0.5.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -573,7 +573,7 @@ class SoundPadPlugin(BasePlugin):
         # Do not depend only on LaunchActivity.onResume: plugin loading can happen
         # after that callback. In overlay mode the application context is enough.
         self.show_panel()
-        log("Mango SoundPad 0.4.8 loaded; startup panel requested")
+        log("Mango SoundPad 0.5.0 loaded; startup panel requested")
     def on_app_event(self,event_type):
         try:
             if event_type in (AppEvent.START,AppEvent.RESUME):
@@ -616,6 +616,25 @@ class SoundPadPlugin(BasePlugin):
             from ui.bulletin import BulletinHelper
             run_on_ui_thread(lambda:BulletinHelper.show_info(msg))
         except Exception:log(msg)
+    def resolve_java_class(self,name):
+        # Resolve an actual java.lang.Class for reflection on Chaquopy builds.
+        try:
+            from java.lang import Class, Thread
+            loader=Thread.currentThread().getContextClassLoader()
+            try:
+                return Class.forName(name,False,loader)
+            except Exception:
+                return Class.forName(name)
+        except Exception as e:
+            log("SoundPad Class.forName failed "+name+": "+str(e))
+        try:
+            c=find_class(name)
+            reflected=getattr(c,"class_",None)
+            return reflected if reflected is not None else c
+        except Exception as e:
+            log("SoundPad find_class fallback failed "+name+": "+str(e))
+            return None
+
     def hook(self,cls,name,types,handler):
         try:
             # getMethod only finds public methods. Android Activity callbacks
@@ -678,7 +697,7 @@ class SoundPadPlugin(BasePlugin):
         from java.lang import Integer, String, Long
         from java.nio import ByteBuffer
         try:
-            c=find_class("org.telegram.messenger.MediaController")
+            c=self.resolve_java_class("org.telegram.messenger.MediaController")
             if c:
                 mixer.record_hook_active=self.hook(c,"writeFrame",[ByteBuffer,Integer.TYPE],RecordFrameHook())
                 self.hook(c,"startRecord",[String,Integer.TYPE],RecordStartHook(self))
@@ -689,7 +708,7 @@ class SoundPadPlugin(BasePlugin):
         try:
             for name in ["org.webrtc.voiceengine.WebRtcAudioRecord","org.webrtc.audio.WebRtcAudioRecord","org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord"]:
                 try:
-                    c=find_class(name)
+                    c=self.resolve_java_class(name)
                     if c and self.hook(c,"nativeDataIsRecorded",[Integer.TYPE,Long.TYPE],VoipAudioHook()):
                         mixer.webrtc_hook_active=True
                         log("SoundPad: WebRTC audio hook installed: "+name)
@@ -697,14 +716,14 @@ class SoundPadPlugin(BasePlugin):
                 except Exception as e:log("SoundPad WebRTC candidate "+name+": "+str(e))
         except Exception as e:log("SoundPad WebRTC hooks: "+str(e))
         try:
-            c=find_class("android.media.AudioRecord")
+            c=self.resolve_java_class("android.media.AudioRecord")
             if c:
                 count=self.hook_audio_record_overloads(c)
                 log("SoundPad: AudioRecord read overloads installed=%d"%count)
                 if count==0:self.dump_audio_methods(c,"AudioRecord")
         except Exception as e:log("SoundPad AudioRecord fallback: "+str(e))
         try:
-            c=find_class("org.telegram.ui.LaunchActivity")
+            c=self.resolve_java_class("org.telegram.ui.LaunchActivity")
             if c:
                 from android.content import Intent
                 resume_hook=ResumeHook(self)
@@ -717,7 +736,7 @@ class SoundPadPlugin(BasePlugin):
                 self.hook(c,"onActivityResult",[Integer.TYPE,Integer.TYPE,Intent],ImportHook(self))
         except Exception as e:log("SoundPad import hooks: "+str(e))
         try:
-            c=find_class("org.telegram.messenger.voip.VoIPService")
+            c=self.resolve_java_class("org.telegram.messenger.voip.VoIPService")
             if c:
                 def read(name,default):
                     try:
