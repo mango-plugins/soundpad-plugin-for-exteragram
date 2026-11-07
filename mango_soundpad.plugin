@@ -39,7 +39,7 @@ __id__ = "soundpad_reloaded"
 __name__ = "Mango SoundPad"
 __description__ = "32-slot soundboard for voice messages, video notes and calls"
 __author__ = "@Mango_mango_mango_mango & ChatGPT"
-__version__ = "0.4.8"
+__version__ = "0.4.9"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -294,25 +294,36 @@ class AudioRecordReadHook(MethodHook):
             stream=str(min((8000,16000,32000,44100,48000),key=lambda x:abs(x-rate)))
             from java import jarray, jbyte
             if hasattr(target,"position") and hasattr(target,"capacity"):
-                end=int(target.position()); length=min(read_count,end); length-=length%2
+                # Android AudioRecord.read(ByteBuffer, ...) writes from index 0
+                # and does not advance ByteBuffer.position().
+                length=min(read_count,int(target.capacity())); length-=length%2
                 if length<=0:return
-                start=end-length; dup=target.duplicate()
-                dup.position(start); dup.limit(start+length)
+                dup=target.duplicate()
+                dup.position(0); dup.limit(length)
                 java_in=jarray(jbyte)(length); dup.get(java_in,0,length)
                 source=bytes((int(v)&255 for v in java_in))
                 mixed=mixer.mix(source,stream)
                 if mixed!=source:
                     java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
-                    dup.position(start); dup.put(java_out,0,min(length,len(java_out)))
+                    dup.position(0); dup.put(java_out,0,min(length,len(java_out)))
             else:
                 offset=int(args[1]) if len(args)>1 else 0
-                length=min(read_count,len(target)-offset); length-=length%2
+                is_short_array=str(target.getClass().getName())=="[S"
+                length=min(read_count,len(target)-offset)*(2 if is_short_array else 1)
+                length-=length%2
                 if length<=0:return
-                source=bytes((int(target[offset+i])&255 for i in range(length)))
+                if is_short_array:
+                    source=b"".join(struct.pack("<h",int(target[offset+i])) for i in range(length//2))
+                else:
+                    source=bytes((int(target[offset+i])&255 for i in range(length)))
                 mixed=mixer.mix(source,stream)
                 if mixed!=source:
-                    java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
-                    for i in range(length): target[offset+i]=java_out[i]
+                    if is_short_array:
+                        samples=struct.unpack("<"+"h"*(len(mixed)//2),mixed)
+                        for i,value in enumerate(samples):target[offset+i]=value
+                    else:
+                        java_out=jarray(jbyte)([(v if v<128 else v-256) for v in mixed[:length]])
+                        for i in range(length): target[offset+i]=java_out[i]
             if rate not in AudioRecordReadHook._logged_rates:
                 AudioRecordReadHook._logged_rates.add(rate)
                 log("SoundPad: AudioRecord.read реально змінює PCM; rate=%d bytes=%d changed=%s"%(rate,length,str(mixed!=source)))
@@ -637,7 +648,7 @@ class SoundPadPlugin(BasePlugin):
                     try:
                         if str(method.getName())!="read": continue
                         params=method.getParameterTypes()
-                        if len(params)<2 or str(params[0].getName()) not in ("java.nio.ByteBuffer","[B"): continue
+                        if len(params)<2 or str(params[0].getName()) not in ("java.nio.ByteBuffer","[B","[S"): continue
                         signature=str(method.toString())
                         if signature in seen: continue
                         seen.add(signature); method.setAccessible(True)
@@ -724,7 +735,7 @@ class SoundPadPlugin(BasePlugin):
         if not path or not os.path.isfile(path):self.notify("Спочатку вибери аудіофайл"); return
         gain=float(self.get_setting("slot_%d_gain"%i,100))/100.0
         mixer.mode="record"
-        log("SoundPad: sound button tapped slot=%d file=%s mode=%s"%(i+1,name,mixer.mode))
+        log("Mango SoundPad: button tapped slot=%d file=%s mode=%s"%(i+1,name,mixer.mode))
         mixer.play(path,gain)
     def stop_all(self):
         log("SoundPad: stop button tapped")
